@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal, cast
 
-from .adapters import claudecode, cloudthinker, codex, copilot, gemini, opencode, stratus
+from .adapters import assistant_v3, claudecode, cloudthinker, codex, copilot, gemini, opencode, stratus
 from .atif import Trajectory
 from .errors import (
     AtifConverterError,
@@ -16,8 +16,18 @@ from .errors import (
     UnsupportedFormatError,
 )
 
-AgentName = Literal["claudecode", "cloudthinker", "codex", "copilot", "gemini", "opencode", "stratus"]
+AgentName = Literal[
+    "assistant_v3",
+    "claudecode",
+    "cloudthinker",
+    "codex",
+    "copilot",
+    "gemini",
+    "opencode",
+    "stratus",
+]
 SUPPORTED_AGENTS: tuple[AgentName, ...] = (
+    "assistant_v3",
     "claudecode",
     "cloudthinker",
     "codex",
@@ -28,6 +38,7 @@ SUPPORTED_AGENTS: tuple[AgentName, ...] = (
 )
 
 _CONVERTERS = {
+    "assistant_v3": assistant_v3.convert_file,
     "claudecode": claudecode.convert_file,
     "cloudthinker": cloudthinker.convert_file,
     "codex": codex.convert_file,
@@ -153,6 +164,10 @@ def _looks_like_cloudthinker(root: dict | None) -> bool:
     return isinstance(root, dict) and root.get("schema") == cloudthinker.SESSION_SCHEMA
 
 
+def _looks_like_assistant_v3(records: list[dict]) -> bool:
+    return bool(records) and records[0].get("schema") == assistant_v3.EVENTS_SCHEMA
+
+
 def _looks_like_stratus(records: list[dict]) -> bool:
     return any(
         record.get("type") == "event" and "stage" in record and isinstance(record.get("messages"), list)
@@ -211,6 +226,8 @@ def detect_agent(session_file: Path | str) -> AgentName:
     path = _require_file(session_file)
     root, records = _load_detection_records(path)
 
+    if _looks_like_assistant_v3(records):
+        return "assistant_v3"
     if _looks_like_cloudthinker(root):
         return "cloudthinker"
     if _looks_like_opencode(root):
