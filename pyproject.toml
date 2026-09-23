@@ -240,6 +240,7 @@ packages = [
     "atif_converter.adapters",
     "atif_converter.atif",
     "sregym",
+    "sregym.observability",
     "sregym.traces",
     "clients",
     "scripts",
