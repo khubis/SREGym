@@ -243,6 +243,8 @@ packages = [
     "sregym.observability",
     "sregym.traces",
     "clients",
+    "clients.assistant_v3",
+    "clients.assistant_v3.prompts",
     "scripts",
     "llm_backend",
     "logger",
@@ -251,3 +253,4 @@ packages = [
 [tool.setuptools.package-data]
 atif_converter = ["README.md"]
 "atif_converter.atif" = ["UPSTREAM.md"]
+"clients.assistant_v3.prompts" = ["*.yaml"]
