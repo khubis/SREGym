@@ -10,6 +10,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 
 import yaml
@@ -149,6 +150,8 @@ class Conductor:
         self.waiting_for_agent: bool = False
         self._evaluating: bool = False  # True while a submission is being evaluated
         self.fault_injected: bool = False
+        self.incident_started_at: datetime | None = None
+        self.incident_ended_at: datetime | None = None
         self._observability_provider: ObservabilityProvider | None = None
         self._observability_context: AttemptContext | None = None
         self.observability_export: ExternalOtlpExport | None = None
@@ -665,6 +668,24 @@ class Conductor:
             f"stage:{open_stage}"
         ):
             self._mark(f"stage:{open_stage}", "end", outcome="no_submission")
+        if self._observability_enabled() and self._observability_provider.name == "splunk":
+            # Some faults own a dedicated workload distinct from the app's
+            # default workload. Quiesce the actual source before auditing the
+            # collector queue; otherwise a continuously emitting fault can
+            # never satisfy the finite-drain check.
+            stop_workload = getattr(getattr(self, "problem", None), "stop_workload", None)
+            if not callable(stop_workload):
+                stop_workload = getattr(getattr(self, "app", None), "stop_workload", None)
+            if callable(stop_workload):
+                try:
+                    # The diagnosis is already closed. Stop new requests so
+                    # the collector can drain a finite trace queue before its
+                    # delivery audit; regular cleanup still runs afterward.
+                    stop_workload()
+                except Exception:
+                    self.logger.exception("Could not quiesce workload before Splunk delivery audit")
+                    self.results["infrastructure_invalid"] = True
+                    self.results["included_in_diagnosis_pass_rate"] = False
         if self._observability_enabled():
             try:
                 with self._phase("observability_delivery"):
@@ -761,6 +782,8 @@ class Conductor:
             self.problem = None
             self.app = None
             self.results = {}
+            self.incident_started_at = None
+            self.incident_ended_at = None
 
         self.execution_start_time = time.time()
         self.problem = self.problems.get_problem_instance(self.problem_id)
@@ -823,6 +846,10 @@ class Conductor:
                 nm.start()
             except Exception as e:
                 self.logger.warning(f"Failed to update NoiseManager context: {e}")
+
+        # The agent's investigation window starts after baseline traffic and
+        # immediately before fault injection, not before application startup.
+        self.incident_started_at = datetime.now(UTC)
 
         # After deployment, advance to the first stage
         self._advance_to_next_stage(start_index=0)
@@ -1607,7 +1634,10 @@ class Conductor:
 
         if not is_train_ticket:
             for ns in app_namespaces:
-                self.jaeger.create_external_name_service(ns, restart_deployments=True)
+                redirect_options = {"restart_deployments": True}
+                if getattr(problem, "preserve_app_local_jaeger_deployment", False):
+                    redirect_options["preserve_deployments"] = True
+                self.jaeger.create_external_name_service(ns, **redirect_options)
                 # The restart forces long-lived Jaeger/OTel clients to resolve
                 # the new ExternalName destination before workload traffic starts.
                 self.kubectl.wait_for_ready(ns)

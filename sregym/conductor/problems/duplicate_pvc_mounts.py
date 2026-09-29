@@ -10,6 +10,11 @@ from sregym.utils.decorators import mark_fault_injected
 
 
 class DuplicatePVCMounts(Problem):
+    @property
+    def preserve_app_local_jaeger_deployment(self) -> bool:
+        """Keep the exact workload the PVC fault will mutate when it is Jaeger."""
+        return self.faulty_service == "jaeger"
+
     def __init__(self, app_name: str = "hotel_reservation", faulty_service: str = "mongodb-rate"):
         self.app_name = app_name
         self.faulty_service = faulty_service
