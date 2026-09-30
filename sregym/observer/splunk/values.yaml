@@ -1,0 +1,150 @@
+# Non-secret overrides for splunk-otel-collector chart 0.160.0.
+fullnameOverride: sregym-splunk-otel
+
+secret:
+  create: false
+  name: sregym-splunk-otel-credentials
+  validateSecret: true
+
+featureGates:
+  mountSplunkSecretAsFile: true
+
+splunkPlatform:
+  logsEnabled: true
+  metricsEnabled: false
+  tracesEnabled: false
+  insecureSkipVerify: false
+  retryOnFailure:
+    enabled: true
+    initialInterval: 5s
+    maxInterval: 30s
+    maxElapsedTime: 300s
+  sendingQueue:
+    enabled: true
+    numConsumers: 4
+    queueSize: 1000
+
+splunkObservability:
+  metricsEnabled: true
+  tracesEnabled: true
+
+agent:
+  enabled: true
+  # The benchmark applications deploy their own node-local OTel agents on
+  # these host ports. Keep this agent's file-log and kubelet-metric collection
+  # while disabling conflicting OTLP listeners.
+  # Kind's kubelet certificate lacks IP SANs, while the chart queries the
+  # kubelet by node IP. Keep service-account authentication, but allow this
+  # local Kind receiver to scrape container CPU metrics despite that cert.
+  config:
+    receivers:
+      kubelet_stats:
+        insecure_skip_verify: true
+  ports:
+    otlp: null
+    otlp-http: null
+    zipkin: null
+    jaeger-thrift: null
+    jaeger-grpc: null
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+clusterReceiver:
+  enabled: true
+  # The object receiver provides the single Kubernetes-event log stream.
+  # Disable the chart's separate k8s_events receiver to avoid duplicates.
+  eventsEnabled: false
+  # Match the approved shared-EKS object scope. Override chart defaults that
+  # would otherwise pull NetworkPolicies and CRDs every six hours.
+  k8sObjects:
+    - name: pods
+      mode: watch
+    - name: events
+      mode: watch
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 300m
+      memory: 512Mi
+
+rbac:
+  customRules:
+    - apiGroups: [""]
+      resources: [pods, events]
+      verbs: [get, list, watch]
+
+# Keep benchmark application logs while avoiding unrelated harness and
+# collector history on the long-lived kind nodes.
+logsCollection:
+  containers:
+    excludePaths:
+      - /var/log/pods/chaos-mesh_*/*/*.log
+      - /var/log/pods/khaos_*/*/*.log
+      - /var/log/pods/kube-system_*/*/*.log
+      - /var/log/pods/observe_*/*/*.log
+      - /var/log/pods/openebs_*/*/*.log
+      - /var/log/pods/sregym-observability_*/*/*.log
+
+gateway:
+  enabled: true
+  tokenPassthrough: false
+  mode: deployment
+  replicaCount: 1
+  config:
+    receivers:
+      prometheus/sregym_application:
+        config:
+          scrape_configs:
+            - job_name: sregym-prometheus-application-federation
+              scrape_interval: 15s
+              scrape_timeout: 10s
+              metrics_path: /federate
+              honor_labels: true
+              params:
+                match[]:
+                  - '{job=~"blackbox-.+|.+-application|otel-spanmetrics.*"}'
+              # `up` describes Prometheus's source scrape, not the application.
+              # An inactive app family legitimately leaves an `up=0` series in
+              # Prometheus; forwarding it makes the downstream receiver report
+              # a false failure for an otherwise healthy /federate scrape.
+              metric_relabel_configs:
+                - source_labels:
+                    - __name__
+                  regex: up
+                  action: drop
+              static_configs:
+                - targets:
+                    - prometheus-server.observe.svc.cluster.local:80
+    processors:
+      resource/sregym_application_metrics:
+        attributes:
+          - action: upsert
+            key: sregym.metric.source
+            value: sregym_prometheus_application
+    service:
+      pipelines:
+        metrics/sregym_application:
+          receivers:
+            - prometheus/sregym_application
+          processors:
+            - memory_limiter
+            - resource/add_cluster_name
+            - resource/add_custom_attrs
+            - resource/sregym_application_metrics
+            - batch
+          exporters:
+            - signalfx
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 1Gi

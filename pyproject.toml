@@ -213,13 +213,25 @@ markers = [
     "integration: end-to-end tests requiring a running Kubernetes cluster",
 ]
 
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+
+[tool.coverage.xml]
+output = "coverage.xml"
+
 [build-system]
 requires = ["setuptools>=80.8.0"]
 build-backend = "setuptools.build_meta"
 
 [dependency-groups]
 dev = [
+    "chardet>=5,<6",
     "deptry>=0.24.0",
+    "diff-cover>=9.7.1",
+    "pytest-cov>=7.0.0",
 ]
 
 [tool.setuptools]
@@ -228,8 +240,11 @@ packages = [
     "atif_converter.adapters",
     "atif_converter.atif",
     "sregym",
+    "sregym.observability",
     "sregym.traces",
     "clients",
+    "clients.assistant_v3",
+    "clients.assistant_v3.prompts",
     "scripts",
     "llm_backend",
     "logger",
@@ -238,3 +253,4 @@ packages = [
 [tool.setuptools.package-data]
 atif_converter = ["README.md"]
 "atif_converter.atif" = ["UPSTREAM.md"]
+"clients.assistant_v3.prompts" = ["*.yaml"]

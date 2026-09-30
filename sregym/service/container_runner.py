@@ -33,6 +33,7 @@ HARDENING_FLAGS = (
     "--security-opt=no-new-privileges",
 )
 AGENT_TOOLS_CONTAINER_PATH = "/opt/agent-tools"
+TRUSTED_CA_BUNDLE_CONTAINER_PATH = "/etc/sregym/trusted-ca-bundle.pem"
 CONTAINER_PATH = f"{AGENT_TOOLS_CONTAINER_PATH}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 
@@ -107,6 +108,8 @@ class ContainerConfig:
     image: str = DEFAULT_AGENT_IMAGE
     network_mode: str = "host"
     kubeconfig_path: Path | None = None
+    kubernetes_access: bool = True
+    sregym_mcp_access: bool = True
     workspace_path: Path | None = None  # bind-mounted to /workspace for agent output
     logs_path: Path | None = None
     sregym_apps_path: Path | None = None
@@ -121,6 +124,7 @@ class ContainerConfig:
     published_ports: list[str] = field(default_factory=list)
     forward_host_credentials: bool = True
     codex_auth: Literal["copy", "shared", "none"] = "copy"
+    trusted_ca_bundle: Path | None = None
 
 
 class ContainerRunner:
@@ -313,20 +317,32 @@ class ContainerRunner:
     def _configured_egress_rules(self, env_vars: dict[str, str]) -> tuple[EndpointRule, ...]:
         rules = {
             EndpointRule("host.docker.internal", int(env_vars.get("API_PORT", "8000")), inspect_tools=False),
-            EndpointRule("host.docker.internal", self.config.k8s_proxy_port, inspect_tools=False),
-            EndpointRule("host.docker.internal", int(env_vars.get("MCP_SERVER_PORT", "9954")), inspect_tools=False),
         }
-        rules.update(
-            provider_endpoint_rules(
-                self.config.internet_policy,
-                env_vars,
-                codex_subscription_auth=(
-                    self.config.internet_policy.is_filtered
-                    and (self.config.internet_policy.agent_name or "").casefold() == "codex"
-                    and _codex_subscription_auth_available(Path.home() / ".codex" / "auth.json")
-                ),
+        if self.config.kubernetes_access:
+            rules.add(EndpointRule("host.docker.internal", self.config.k8s_proxy_port, inspect_tools=False))
+        if self.config.sregym_mcp_access:
+            rules.add(
+                EndpointRule(
+                    "host.docker.internal", int(env_vars.get("MCP_SERVER_PORT", "9954")), inspect_tools=False
+                )
             )
-        )
+        if (self.config.internet_policy.agent_name or "").casefold() == "assistant_v3":
+            assistant_url = env_vars.get("ASSISTANT_V3_URL", "").strip()
+            if not assistant_url:
+                raise ValueError("Filtered Assistant v3 access requires ASSISTANT_V3_URL")
+            rules.add(EndpointRule.host_from_url(assistant_url))
+        else:
+            rules.update(
+                provider_endpoint_rules(
+                    self.config.internet_policy,
+                    env_vars,
+                    codex_subscription_auth=(
+                        self.config.internet_policy.is_filtered
+                        and (self.config.internet_policy.agent_name or "").casefold() == "codex"
+                        and _codex_subscription_auth_available(Path.home() / ".codex" / "auth.json")
+                    ),
+                )
+            )
         rules.update(
             EndpointRule.from_url(_replace_loopback_host(endpoint))
             for endpoint in self.config.internet_policy.additional_allowed_endpoints
@@ -396,7 +412,7 @@ class ContainerRunner:
         return result
 
     def _mount_codex_credentials(self, args: list[str]) -> None:
-        """Copy auth read-only for agents; share only the auth file for judge refreshes."""
+        """Copy auth read-only for agents; share judge auth and signed policy state."""
         if self.config.codex_auth == "none":
             return
         auth_src = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "auth.json"
@@ -406,6 +422,11 @@ class ContainerRunner:
 
         if self.config.codex_auth == "shared":
             args.extend(["-v", f"{auth_src.resolve()}:/root/.codex/auth.json:rw"])
+            for name in ("cloud-config-bundle-cache.json", "cloud-requirements-cache.json"):
+                cache_src = auth_src.parent / name
+                if cache_src.is_symlink() or not cache_src.is_file() or not os.access(cache_src, os.R_OK):
+                    continue
+                args.extend(["-v", f"{cache_src.resolve()}:/root/.codex/{name}:ro"])
             return
 
         tmp = tempfile.mkdtemp(prefix="sregym-codex-")
@@ -414,6 +435,14 @@ class ContainerRunner:
 
         args.extend(["-v", f"{auth_dst}:/root/.codex/auth.json:ro"])
         self._credential_tmps.append(tmp)
+
+    def _validated_trusted_ca_bundle(self) -> Path | None:
+        source = self.config.trusted_ca_bundle
+        if source is None or self.config.internet_policy.is_filtered:
+            return None
+        if source.is_symlink() or not source.is_file() or not os.access(source, os.R_OK):
+            raise ValueError("Configured trusted CA bundle must be a readable regular file, not a symlink")
+        return source.resolve()
 
     def _run_uses_aws(self, extra_env: dict[str, str] | None = None) -> bool:
         """Whether this run resolves AWS credentials, and so needs ~/.aws."""
@@ -455,6 +484,12 @@ class ContainerRunner:
         if extra_env:
             env_vars.update(extra_env)
 
+        if not self.config.kubernetes_access:
+            env_vars.pop("KUBECONFIG", None)
+        if not self.config.sregym_mcp_access:
+            env_vars.pop("MCP_SERVER_PORT", None)
+            env_vars.pop("MCP_SERVER_URL", None)
+
         # The judge runs on the host. Its model and credentials are not inputs
         # to the evaluated agent and must not enter the agent container.
         for name in ("JUDGE_MODEL_ID", "JUDGE_API_BASE", "JUDGE_API_KEY"):
@@ -465,6 +500,10 @@ class ContainerRunner:
             env_vars.setdefault("TYPESAFE_API_KEY", os.environ.get("TYPESAFE_API_KEY", ""))
 
         env_vars["AGENT_INTERNET_ACCESS"] = self.internet_access_mode
+
+        if self._validated_trusted_ca_bundle() is not None:
+            for name in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS"):
+                env_vars[name] = TRUSTED_CA_BUNDLE_CONTAINER_PATH
 
         # Docker Desktop and filtered containers cannot reach host loopback
         # directly. Rewrite every forwarded provider endpoint that points to a
@@ -482,8 +521,9 @@ class ContainerRunner:
         # running on the host, including the MCP port-forward.
         if self.config.network_mode == "host" or self.config.internet_policy.is_filtered:
             env_vars["API_HOSTNAME"] = "host.docker.internal"
-            mcp_port = env_vars.get("MCP_SERVER_PORT", os.environ.get("MCP_SERVER_PORT", "9954"))
-            env_vars["MCP_SERVER_URL"] = f"http://host.docker.internal:{mcp_port}"
+            if self.config.sregym_mcp_access:
+                mcp_port = env_vars.get("MCP_SERVER_PORT", os.environ.get("MCP_SERVER_PORT", "9954"))
+                env_vars["MCP_SERVER_URL"] = f"http://host.docker.internal:{mcp_port}"
 
         if self._agent_tools_volume is not None:
             env_vars["PATH"] = CONTAINER_PATH
@@ -533,7 +573,7 @@ class ContainerRunner:
             args.extend(["-v", f"{self._agent_tools_volume}:{AGENT_TOOLS_CONTAINER_PATH}:ro"])
 
         # Mount kubeconfig (read-only)
-        if self.config.kubeconfig_path and self.config.kubeconfig_path.exists():
+        if self.config.kubernetes_access and self.config.kubeconfig_path and self.config.kubeconfig_path.exists():
             kubeconfig_path = self._prepare_kubeconfig(self.config.kubeconfig_path)
             args.extend(["-v", f"{kubeconfig_path.resolve()}:/root/.kube/config:ro"])
             args.extend(["-e", "KUBECONFIG=/root/.kube/config"])
@@ -549,6 +589,9 @@ class ContainerRunner:
                 logger.debug("Skipping ~/.aws mount: no AWS credentials selected for this run")
 
         self._mount_codex_credentials(args)
+
+        if ca_bundle := self._validated_trusted_ca_bundle():
+            args.extend(["-v", f"{ca_bundle}:{TRUSTED_CA_BUNDLE_CONTAINER_PATH}:ro"])
 
         for port in self.config.published_ports:
             args.extend(["-p", port])

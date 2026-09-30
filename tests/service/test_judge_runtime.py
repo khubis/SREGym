@@ -88,6 +88,35 @@ def test_api_mode_preserves_manual_endpoint_without_starting_container(docker):
     runtime.subprocess.Popen.assert_not_called()
 
 
+def test_cli_mode_can_reuse_an_explicit_healthy_bridge(docker, monkeypatch):
+    monkeypatch.setenv("SREGYM_JUDGE_BRIDGE_URL", "http://127.0.0.1:4101/v1")
+    monkeypatch.setenv("SREGYM_REUSE_JUDGE_BRIDGE", "true")
+
+    with runtime.managed_judge_backend("codex", force_build=False) as image:
+        assert image == LOCAL_AGENT_IMAGE
+        assert os.environ["SREGYM_JUDGE_BRIDGE_URL"] == "http://127.0.0.1:4101/v1"
+
+    runtime.subprocess.Popen.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("bridge_url", "force_build", "message"),
+    [
+        (None, False, "requires SREGYM_JUDGE_BRIDGE_URL"),
+        ("http://127.0.0.1:4101/v1", True, "Build the local agent image"),
+    ],
+)
+def test_reused_cli_bridge_rejects_incomplete_setup(docker, monkeypatch, bridge_url, force_build, message):
+    monkeypatch.setenv("SREGYM_REUSE_JUDGE_BRIDGE", "true")
+    if bridge_url:
+        monkeypatch.setenv("SREGYM_JUDGE_BRIDGE_URL", bridge_url)
+
+    with pytest.raises(ValueError, match=message), runtime.managed_judge_backend("codex", force_build=force_build):
+        pytest.fail("invalid external bridge setup must not start a benchmark")
+
+    runtime.subprocess.Popen.assert_not_called()
+
+
 @pytest.mark.parametrize("backend", ["api", "cursor"])
 @pytest.mark.parametrize("external", [False, True])
 def test_main_selects_backend_and_skips_it_for_external_harness(docker, monkeypatch, backend, external):
@@ -190,6 +219,35 @@ def test_codex_uses_only_selected_subscription_file(docker, monkeypatch, tmp_pat
         with runtime.managed_judge_backend("codex"):
             assert f"{path}:/root/.codex/auth.json:rw" in runtime.subprocess.Popen.call_args.args[0]
         assert json.loads(path.read_text()) == auth
+
+
+def test_codex_judge_mounts_selected_signed_policy_caches_read_only(docker, monkeypatch, tmp_path):
+    codex_home = tmp_path / "selected-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    (codex_home / "auth.json").write_text('{"tokens": {"access_token": "selected-profile"}}')
+    cache_names = ("cloud-config-bundle-cache.json", "cloud-requirements-cache.json")
+    for name in cache_names:
+        (codex_home / name).write_text('{"signature": "signed", "signed_payload": "payload"}')
+    (codex_home / "config.toml").write_text('model = "must-not-be-mounted"')
+
+    with runtime.managed_judge_backend("codex"):
+        command = runtime.subprocess.Popen.call_args.args[0]
+        for name in cache_names:
+            assert f"{codex_home / name}:/root/.codex/{name}:ro" in command
+        assert not any("config.toml" in argument for argument in command)
+
+
+def test_cli_judge_uses_explicit_host_ca_bundle(docker, monkeypatch, tmp_path):
+    ca_bundle = tmp_path / "host-ca-bundle.pem"
+    ca_bundle.write_text("trusted certificates")
+    monkeypatch.setenv("SSL_CERT_FILE", str(ca_bundle))
+
+    with runtime.managed_judge_backend("codex"):
+        command = runtime.subprocess.Popen.call_args.args[0]
+
+    assert f"{ca_bundle}:/etc/sregym/trusted-ca-bundle.pem:ro" in command
+    assert "SSL_CERT_FILE=/etc/sregym/trusted-ca-bundle.pem" in command
 
 
 @pytest.mark.parametrize("model", ["local/gpt-5", "gpt-5"])
