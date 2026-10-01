@@ -28,6 +28,8 @@ def _environment() -> dict[str, str]:
         "SPLUNK_LOGS_CONNECTION_ID": "connection123",
         "ASSISTANT_V3_URL": "http://127.0.0.1:8903",
         "ASSISTANT_V3_AUTH_TOKEN": "assistant-secret",
+        "JUDGE_API_KEY": "judge-secret",
+        "JUDGE_API_BASE": "https://judge.example.test",
     }
 
 
@@ -65,6 +67,13 @@ def test_unknown_credential_profile_fails() -> None:
         repeat.resolve_environment({}, profile="auto")
 
 
+def test_judge_credentials_are_required_before_launch() -> None:
+    source = _environment()
+    del source["JUDGE_API_KEY"]
+    with pytest.raises(repeat.RepeatError, match="JUDGE_API_KEY"):
+        repeat.resolve_environment(source, profile="synthetic")
+
+
 def test_headroom_gate_fails_closed() -> None:
     gib = 1024**3
     with pytest.raises(repeat.RepeatError, match="memory"):
@@ -73,6 +82,35 @@ def test_headroom_gate_fails_closed() -> None:
         repeat.check_headroom(available_bytes=7 * gib, free_disk_bytes=2 * gib, docker_memory_bytes=10 * gib)
     with pytest.raises(repeat.RepeatError, match="Docker"):
         repeat.check_headroom(available_bytes=7 * gib, free_disk_bytes=20 * gib, docker_memory_bytes=4 * gib)
+
+
+def test_resource_wait_retries_only_transient_memory_pressure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    def preflight(*_args: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise repeat.RepeatError("less than 4 GiB available host memory")
+
+    monkeypatch.setattr(repeat, "_host_preflight", preflight)
+    monkeypatch.setattr(repeat.time, "sleep", sleeps.append)
+    repeat.wait_for_host_preflight(tmp_path, "image:tag", 4.0, retries=3, interval_seconds=30)
+    assert attempts == 3
+    assert sleeps == [30, 30]
+    monkeypatch.setattr(repeat, "_host_preflight", lambda *_: (_ for _ in ()).throw(repeat.RepeatError("less than 10 GiB free disk")))
+    with pytest.raises(repeat.RepeatError, match="disk"):
+        repeat.wait_for_host_preflight(tmp_path, "image:tag", 4.0, retries=3, interval_seconds=30)
+    assert sleeps == [30, 30]
+    monkeypatch.setattr(repeat, "_host_preflight", lambda *_: (_ for _ in ()).throw(repeat.RepeatError("less than 4 GiB available host memory")))
+    with pytest.raises(repeat.RepeatError, match="memory"):
+        repeat.wait_for_host_preflight(tmp_path, "image:tag", 4.0, retries=2, interval_seconds=30)
+    assert sleeps == [30, 30, 30]
+    with pytest.raises(repeat.RepeatError, match="settings"):
+        repeat.wait_for_host_preflight(tmp_path, "image:tag", 4.0, retries=0)
+    with pytest.raises(repeat.RepeatError, match="memory"):
+        repeat.wait_for_host_preflight(tmp_path, "image:tag", 4.0, retries=1)
 
 
 def test_single_case_memory_override_keeps_a_four_gib_floor() -> None:
@@ -104,6 +142,7 @@ def test_suite_command_is_sequential_pilot_configuration(tmp_path: Path) -> None
     assert command[command.index("--profile") + 1] == "svelte"
     assert command[command.index("--assistant-prompt-arm") + 1] == "symptom_guided"
     assert "--force-build" not in command
+    assert command[command.index("--agent-timeout") + 1] == "1200"
 
     with pytest.raises(repeat.RepeatError, match="resume CSV"):
         repeat.suite_command(
@@ -134,6 +173,10 @@ def _run(batch: Path, case_id: str, *, valid: bool = True) -> Path:
                 "problem_id": case_id,
                 "classification": "completed" if valid else "infrastructure_invalid",
                 "observability_provider": "splunk",
+                "benchmark_profile": "svelte",
+                "requested_model": "gpt-5.6-luna",
+                "requested_reasoning": "medium",
+                "judge_model": "azure/gpt-5.6-luna",
                 "logs_connection_id": "connection123",
                 "run_id": "run123",
             }
@@ -169,6 +212,58 @@ def test_valid_run_selection_keeps_partial_progress_and_rejects_duplicates(tmp_p
     assert repeat.select_valid_runs([first], ["case_c"]) == ({}, ["case_c"])
 
 
+def test_campaign_record_rejects_target_drift_and_unowned_batches(tmp_path: Path) -> None:
+    results = tmp_path / "results"
+    results.mkdir()
+    output = results / "reproductions/pilot"
+    expected = ["case_a", "case_b"]
+    environment = repeat.resolve_environment(_environment(), profile="synthetic")
+    state = repeat.load_campaign(output, tmp_path, expected, environment, "synthetic", "image:tag")
+    assert state["batches"] == []
+    repeat.save_campaign(output, state)
+    assert repeat.load_campaign(output, tmp_path, expected, environment, "synthetic", "image:tag") == state
+    changed = dict(environment, ORG_ID="other-org")
+    with pytest.raises(repeat.RepeatError, match="different target"):
+        repeat.load_campaign(output, tmp_path, expected, changed, "synthetic", "image:tag")
+    with pytest.raises(repeat.RepeatError, match="different target"):
+        repeat.load_campaign(output, tmp_path, expected, environment, "synthetic", "other:tag")
+    state["batches"] = ["../outside"]
+    repeat.save_campaign(output, state)
+    with pytest.raises(repeat.RepeatError, match="batch path"):
+        repeat.load_campaign(output, tmp_path, expected, environment, "synthetic", "image:tag")
+    state["batches"] = []
+    state["pending"] = {"case_id": "unknown", "before": []}
+    repeat.save_campaign(output, state)
+    with pytest.raises(repeat.RepeatError, match="pending work"):
+        repeat.load_campaign(output, tmp_path, expected, environment, "synthetic", "image:tag")
+    (output / "campaign.json").write_text("{broken")
+    with pytest.raises(repeat.RepeatError, match="unreadable"):
+        repeat.load_campaign(output, tmp_path, expected, environment, "synthetic", "image:tag")
+    (output / "campaign.json").unlink()
+    (output / "summary.md").write_text("prior output")
+    with pytest.raises(repeat.RepeatError, match="without a campaign record"):
+        repeat.load_campaign(output, tmp_path, expected, environment, "synthetic", "image:tag")
+
+
+def test_recover_pending_batch_after_interruption(tmp_path: Path) -> None:
+    results = tmp_path / "results"
+    results.mkdir()
+    output = results / "reproductions/pilot"
+    environment = repeat.resolve_environment(_environment(), profile="synthetic")
+    state = repeat.load_campaign(output, tmp_path, ["case_a"], environment, "synthetic", "image:tag")
+    state["pending"] = {"case_id": "case_a", "before": []}
+    repeat.save_campaign(output, state)
+    (results / "0930_1200").mkdir()
+    recovered = repeat.recover_pending(output, tmp_path, state)
+    assert recovered["batches"] == ["0930_1200"]
+    assert recovered["pending"] is None
+    assert repeat.recover_pending(output, tmp_path, recovered) == recovered
+    recovered["pending"] = {"case_id": "case_a", "before": []}
+    (results / "0930_1201").mkdir()
+    with pytest.raises(repeat.RepeatError, match="multiple raw batches"):
+        repeat.recover_pending(output, tmp_path, recovered)
+
+
 def test_selection_report_binds_existing_attempts_without_secrets(tmp_path: Path) -> None:
     batch = tmp_path / "results" / "batch1"
     run = _run(batch, "case_a")
@@ -198,6 +293,95 @@ def test_selection_report_refuses_missing_or_ambiguous_judge(tmp_path: Path) -> 
     (run / "case_a_results.csv").write_text("Diagnosis.accuracy\n78\n")
     with pytest.raises(repeat.RepeatError, match="raw scorecard"):
         repeat.write_selection_report(report, {"case_a": run}, [])
+
+
+def test_campaign_summary_shows_valid_invalid_and_missing_without_invented_scores(tmp_path: Path) -> None:
+    output = tmp_path / "results/reproductions/pilot"
+    valid_batch, invalid_batch = tmp_path / "results/batch1", tmp_path / "results/batch2"
+    valid = _run(valid_batch, "case_a")
+    _run(invalid_batch, "case_b", valid=False)
+    dossier = output / "by-case/case_a"
+    dossier.mkdir(parents=True)
+    (dossier / "manifest.json").write_text(json.dumps({"case_id": "case_a", "benchmark_score": 78.0}))
+    (dossier / "pre_agent_proof.json").write_text(
+        json.dumps({"causal": {"status": "confirmed", "visibility": "fully_splunk_observable"}})
+    )
+    for name in repeat._SUMMARY_LINKS:
+        (dossier / name).touch()
+
+    repeat.write_campaign_summary(
+        output / "summary.md", {"case_a": valid}, ["case_a", "case_b", "case_c"],
+        [valid_batch, invalid_batch],
+    )
+
+    summary = (output / "summary.md").read_text()
+    assert "78/100 across 1 valid attempt" in summary
+    assert "| case_a | valid | 78 | confirmed |" in summary
+    assert "by-case/case_a/final_answer.md" in summary
+    assert "by-case/case_a/benchmark_ground_truth.md" in summary
+    assert "by-case/case_a/judge_raw.csv" in summary
+    assert "by-case/case_a/atif_trace.json" in summary
+    assert "| case_b | infrastructure_invalid | — | — |" in summary
+    assert "| case_c | missing | — | — |" in summary
+    assert "query-secret" not in summary
+
+
+def test_campaign_summary_rejects_incomplete_valid_dossier(tmp_path: Path) -> None:
+    run = _run(tmp_path / "results/batch1", "case_a")
+    with pytest.raises(repeat.RepeatError, match="dossier"):
+        repeat.write_campaign_summary(
+            tmp_path / "results/out/summary.md", {"case_a": run}, ["case_a"], [tmp_path / "results/batch1"]
+        )
+
+
+def test_campaign_summary_rejects_wrong_case_and_bad_score(tmp_path: Path) -> None:
+    batch = tmp_path / "results/batch1"
+    run = _run(batch, "case_a")
+    dossier = tmp_path / "results/out/by-case/case_a"
+    dossier.mkdir(parents=True)
+    for name in (*repeat._SUMMARY_LINKS, "pre_agent_proof.json"):
+        (dossier / name).touch()
+    (dossier / "pre_agent_proof.json").write_text(json.dumps({"causal": {"status": "confirmed"}}))
+    manifest = dossier / "manifest.json"
+    manifest.write_text(json.dumps({"case_id": "other", "benchmark_score": 50}))
+    with pytest.raises(repeat.RepeatError, match="identity mismatch"):
+        repeat.write_campaign_summary(tmp_path / "results/out/summary.md", {"case_a": run}, ["case_a"], [batch])
+    manifest.write_text(json.dumps({"case_id": "case_a", "benchmark_score": 101}))
+    with pytest.raises(repeat.RepeatError, match="invalid benchmark score"):
+        repeat.write_campaign_summary(tmp_path / "results/out/summary.md", {"case_a": run}, ["case_a"], [batch])
+
+
+def test_campaign_summary_classifies_failed_delivery_and_missing_metadata(tmp_path: Path) -> None:
+    batch = tmp_path / "results/batch1"
+    completed = _run(batch, "case_a")
+    (completed / "observability/delivery.json").write_text(json.dumps({"valid": False}))
+    missing_metadata = _run(batch, "case_b", valid=False)
+    (missing_metadata / "run_metadata.json").unlink()
+    report = tmp_path / "results/out/summary.md"
+    repeat.write_campaign_summary(report, {}, ["case_a", "case_b"], [batch])
+    summary = report.read_text()
+    assert "| case_a | delivery_invalid | — | — |" in summary
+    assert "| case_b | incomplete | — | — | — |" in summary
+
+
+def test_campaign_summary_preserves_corrupt_invalid_attempt_as_incomplete(tmp_path: Path) -> None:
+    batch = tmp_path / "results/batch1"
+    run = _run(batch, "case_a", valid=False)
+    (run / "run_metadata.json").write_text("{truncated")
+    report = tmp_path / "results/out/summary.md"
+    repeat.write_campaign_summary(report, {}, ["case_a"], [batch])
+    assert "| case_a | incomplete | — | — |" in report.read_text()
+
+
+def test_finalize_without_valid_attempt_still_reports_failure(tmp_path: Path) -> None:
+    batch = tmp_path / "results/batch1"
+    _run(batch, "case_a", valid=False)
+    output = tmp_path / "results/reproductions/pilot"
+    assert repeat.finalize(tmp_path, output, [batch], ["case_a", "case_b"], _environment()) == (0, 2)
+    report = (output / "summary.md").read_text()
+    assert "0 valid attempts" in report
+    assert "infrastructure_invalid" in report
+    assert "missing" in report
 
 
 def test_postrun_proof_rejects_wrong_connection_or_attempt(tmp_path: Path) -> None:
@@ -243,13 +427,14 @@ def test_finalize_reuses_saved_signal_proof_and_checkpoints_before_dossier(
     calls: list[str] = []
     monkeypatch.setattr(repeat, "checkpoint_attempt", lambda *_: calls.append("checkpoint"))
     monkeypatch.setattr(repeat, "build_dossiers", lambda *_: calls.append("dossier"))
+    monkeypatch.setattr(repeat, "write_campaign_summary", lambda *_: calls.append("summary"))
 
     count, missing = repeat.finalize(
         tmp_path, tmp_path / "results/reproductions/pilot", [batch], ["case_a", "case_b"], _environment()
     )
 
     assert (count, missing) == (1, 1)
-    assert calls == ["checkpoint", "dossier"]
+    assert calls == ["checkpoint", "dossier", "summary"]
 
 
 def test_finalize_retries_saved_query_error_before_publishing(
@@ -305,18 +490,21 @@ def test_finalize_retries_saved_query_error_before_publishing(
     monkeypatch.setattr(splunk_lite_evidence, "verify_case_delivery", retry)
     monkeypatch.setattr(repeat, "checkpoint_attempt", lambda *_: calls.append("checkpoint"))
     monkeypatch.setattr(repeat, "build_dossiers", lambda *_: calls.append("dossier"))
+    monkeypatch.setattr(repeat, "write_campaign_summary", lambda *_: calls.append("summary"))
     assert repeat.finalize(tmp_path, tmp_path / "results/reproductions/pilot", [batch], ["case_a"], _environment()) == (
         1,
         0,
     )
-    assert calls == ["retried", "checkpoint", "dossier"]
+    assert calls == ["retried", "checkpoint", "dossier", "summary"]
 
 
 def test_finalize_needs_at_least_one_valid_case(tmp_path: Path) -> None:
     with pytest.raises(repeat.RepeatError, match="raw batch"):
         repeat.finalize(tmp_path, tmp_path / "results/out", [], ["case_a"], _environment())
-    with pytest.raises(repeat.RepeatError, match="no completed valid"):
-        repeat.finalize(tmp_path, tmp_path / "results/out", [tmp_path / "batch"], ["case_a"], _environment())
+    assert repeat.finalize(tmp_path, tmp_path / "results/out", [tmp_path / "batch"], ["case_a"], _environment()) == (
+        0,
+        1,
+    )
     assert repeat._batches(tmp_path / "absent") == set()
 
 
@@ -370,6 +558,7 @@ def test_run_cli_launches_only_one_case_and_passes_mapped_credentials(
     (tmp_path / "results").mkdir()
     monkeypatch.setattr(repeat.os, "environ", _environment())
     monkeypatch.setattr(repeat, "_host_preflight", lambda *_: None)
+    monkeypatch.setattr(repeat, "_prepared_runtime_preflight", lambda *_: None)
     launched: list[list[str]] = []
 
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -377,6 +566,7 @@ def test_run_cli_launches_only_one_case_and_passes_mapped_credentials(
         assert kwargs["env"]["SF_TOKEN"] == "query-secret"
         assert kwargs["env"]["ORG_ID"] == "synthetic-org"
         (tmp_path / "results/0928_2359").mkdir()
+        _run(tmp_path / "results/0928_2359", case)
         return subprocess.CompletedProcess(command, 0)
 
     monkeypatch.setattr(repeat.subprocess, "run", fake_run)
@@ -411,6 +601,98 @@ def test_run_cli_launches_only_one_case_and_passes_mapped_credentials(
     assert packaged == [(tmp_path / "results/0928_2359",)]
 
 
+def test_full_campaign_resumes_after_saved_case_without_relaunching_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cases = list(repeat.SREGYM_LITE_PROBLEMS)[:3]
+    (tmp_path / "results").mkdir()
+    output = tmp_path / "results/reproductions/pilot"
+    monkeypatch.setattr(repeat.os, "environ", _environment())
+    monkeypatch.setattr(repeat, "SREGYM_LITE_PROBLEMS", cases)
+    monkeypatch.setattr(repeat, "_host_preflight", lambda *_: None)
+    monkeypatch.setattr(repeat, "_prepared_runtime_preflight", lambda *_: None)
+    monkeypatch.setattr(repeat, "finalize", lambda *_: (0, 0))
+    launches: list[str] = []
+
+    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        case = command[command.index("--problem") + 1]
+        launches.append(case)
+        batch = tmp_path / "results" / f"0930_12{len(launches):02d}"
+        batch.mkdir()
+        _run(batch, case, valid=len(launches) != 2)
+        return subprocess.CompletedProcess(command, 0 if len(launches) != 2 else 1)
+
+    monkeypatch.setattr(repeat.subprocess, "run", fake_run)
+    args = ["run", "--credentials", "synthetic", "--repository", str(tmp_path), "--output", str(output)]
+    assert repeat.main(args) == 1
+    assert launches == cases[:2]
+    assert (output / "campaign.json").is_file()
+    assert repeat.main(args) == 0
+    assert launches == [cases[0], cases[1], cases[1], cases[2]]
+    assert len(json.loads((output / "campaign.json").read_text())["batches"]) == 4
+
+
+def test_abrupt_wrapper_interruption_recovers_one_pending_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cases = list(repeat.SREGYM_LITE_PROBLEMS)[:2]
+    (tmp_path / "results").mkdir()
+    output = tmp_path / "results/reproductions/pilot"
+    monkeypatch.setattr(repeat.os, "environ", _environment())
+    monkeypatch.setattr(repeat, "SREGYM_LITE_PROBLEMS", cases)
+    monkeypatch.setattr(repeat, "_host_preflight", lambda *_: None)
+    monkeypatch.setattr(repeat, "_prepared_runtime_preflight", lambda *_: None)
+    monkeypatch.setattr(repeat, "finalize", lambda *_: (0, 0))
+    launched: list[str] = []
+
+    def interrupted(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        case = command[command.index("--problem") + 1]
+        launched.append(case)
+        batch = tmp_path / "results" / f"0930_12{len(launched):02d}"
+        batch.mkdir()
+        _run(batch, case)
+        if len(launched) == 2:
+            raise KeyboardInterrupt
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(repeat.subprocess, "run", interrupted)
+    args = ["run", "--credentials", "synthetic", "--repository", str(tmp_path), "--output", str(output)]
+    with pytest.raises(KeyboardInterrupt):
+        repeat.main(args)
+    assert json.loads((output / "campaign.json").read_text())["pending"]["case_id"] == cases[1]
+    assert repeat.main(args) == 0
+    assert launched == cases
+    assert json.loads((output / "campaign.json").read_text())["pending"] is None
+
+
+def test_selected_attempt_identity_rejects_wrong_model_or_connection(tmp_path: Path) -> None:
+    run = _run(tmp_path / "batch", "case_a")
+    metadata_path = run / "run_metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.update(benchmark_profile="svelte", requested_model="gpt-5.6-luna", requested_reasoning="medium",
+                    judge_model="azure/gpt-5.6-luna")
+    metadata_path.write_text(json.dumps(metadata))
+    repeat.validate_selected_identity({"case_a": run}, repeat.resolve_environment(_environment(), profile="synthetic"))
+    metadata["requested_model"] = "other"
+    metadata_path.write_text(json.dumps(metadata))
+    with pytest.raises(repeat.RepeatError, match="model"):
+        repeat.validate_selected_identity({"case_a": run}, repeat.resolve_environment(_environment(), profile="synthetic"))
+    metadata_path.write_text("{broken")
+    with pytest.raises(repeat.RepeatError, match="unreadable"):
+        repeat.validate_selected_identity({"case_a": run}, repeat.resolve_environment(_environment(), profile="synthetic"))
+
+
+def test_run_rejects_manual_resume_controls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "results").mkdir()
+    monkeypatch.setattr(repeat.os, "environ", _environment())
+    monkeypatch.setattr(repeat, "_host_preflight", lambda *_: pytest.fail("launched"))
+    assert repeat.main([
+        "run", "--credentials", "synthetic", "--repository", str(tmp_path),
+        "--output", str(tmp_path / "results/reproductions/pilot"),
+        "--resume-csv", str(tmp_path / "missing.csv"),
+    ]) == 2
+
+
 def test_run_cli_rejects_low_headroom_before_launch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -422,6 +704,7 @@ def test_run_cli_rejects_low_headroom_before_launch(
         "_host_preflight",
         lambda *_: (_ for _ in ()).throw(repeat.RepeatError("less than 6 GiB available host memory")),
     )
+    monkeypatch.setattr(repeat.time, "sleep", lambda *_: None)
     monkeypatch.setattr(repeat.subprocess, "run", lambda *_args, **_kwargs: pytest.fail("launched"))
     exit_code = repeat.main(
         [
@@ -437,17 +720,29 @@ def test_run_cli_rejects_low_headroom_before_launch(
     assert exit_code == 2
 
 
-def test_run_cli_rejects_reduced_memory_gate_for_full_suite(
+def test_run_cli_accepts_four_gib_floor_for_sequential_suite(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (tmp_path / "results").mkdir()
     monkeypatch.setattr(repeat.os, "environ", _environment())
-    monkeypatch.setattr(repeat, "_host_preflight", lambda *_: pytest.fail("started preflight"))
+    floors: list[float] = []
+    monkeypatch.setattr(repeat, "_host_preflight", lambda _repo, _image, floor: floors.append(floor))
+    monkeypatch.setattr(repeat, "_prepared_runtime_preflight", lambda: None)
+    monkeypatch.setattr(repeat, "finalize", lambda *_: (0, 0))
+    monkeypatch.setattr(repeat, "SREGYM_LITE_PROBLEMS", list(repeat.SREGYM_LITE_PROBLEMS)[:2])
+    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        case = command[command.index("--problem") + 1]
+        batch = tmp_path / "results" / f"0930_12{len(floors):02d}"
+        batch.mkdir()
+        _run(batch, case)
+        return subprocess.CompletedProcess(command, 0)
+    monkeypatch.setattr(repeat.subprocess, "run", fake_run)
     assert repeat.main([
         "run", "--credentials", "synthetic", "--repository", str(tmp_path),
         "--output", str(tmp_path / "results/reproductions/pilot"),
         "--min-available-gib", "4",
-    ]) == 2
+    ]) == 0
+    assert floors == [4.0, 4.0]
 
 
 def test_host_preflight_uses_docker_limit_and_rejects_missing_image(
@@ -480,6 +775,71 @@ def test_host_preflight_uses_docker_limit_and_rejects_missing_image(
     monkeypatch.setattr(repeat.subprocess, "run", missing_image)
     with pytest.raises(repeat.RepeatError, match="prebuilt agent image"):
         repeat._host_preflight(tmp_path, "missing:tag")
+
+
+def test_prepared_runtime_preflight_requires_ready_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    def kubectl(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(
+            command, 0,
+            stdout=json.dumps({"items": [{"status": {"conditions": [{"type": "Ready", "status": "True"}]}}]}),
+        )
+
+    monkeypatch.setattr(repeat.subprocess, "run", kubectl)
+    repeat._prepared_runtime_preflight()
+    assert calls == [["kubectl", "get", "nodes", "-o", "json"]]
+
+
+def test_prepared_runtime_preflight_rejects_unready_nodes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        repeat.subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps({"items": [{"status": {"conditions": [{"type": "Ready", "status": "False"}]}}]}),
+        ),
+    )
+    with pytest.raises(repeat.RepeatError, match="Kubernetes nodes are not ready"):
+        repeat._prepared_runtime_preflight()
+    monkeypatch.setattr(
+        repeat.subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(
+            command, 0, stdout=json.dumps({"items": [{"status": {"conditions": [None]}}]})
+        ),
+    )
+    with pytest.raises(repeat.RepeatError, match="Kubernetes nodes are not ready"):
+        repeat._prepared_runtime_preflight()
+
+
+def test_prepared_runtime_preflight_rejects_kubectl_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        repeat.subprocess, "run", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("private context"))
+    )
+    with pytest.raises(repeat.RepeatError, match="selected context is unavailable") as error:
+        repeat._prepared_runtime_preflight()
+    assert "private context" not in str(error.value)
+
+
+def test_run_does_not_launch_when_cluster_preflight_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "results").mkdir()
+    monkeypatch.setattr(repeat.os, "environ", _environment())
+    monkeypatch.setattr(repeat, "_host_preflight", lambda *_: None)
+    monkeypatch.setattr(
+        repeat, "_prepared_runtime_preflight", lambda *_: (_ for _ in ()).throw(repeat.RepeatError("not ready"))
+    )
+    monkeypatch.setattr(repeat.subprocess, "run", lambda *_args, **_kwargs: pytest.fail("launched runner"))
+    assert repeat.main([
+        "run", "--credentials", "synthetic", "--repository", str(tmp_path),
+        "--output", str(tmp_path / "results/reproductions/pilot"),
+    ]) == 2
 
 
 def test_finalize_cli_does_not_start_docker_and_rejects_external_output(
@@ -520,6 +880,7 @@ def test_run_cli_failure_paths_preserve_result_and_do_not_claim_success(
     results.mkdir()
     monkeypatch.setattr(repeat.os, "environ", _environment())
     monkeypatch.setattr(repeat, "_host_preflight", lambda *_: None)
+    monkeypatch.setattr(repeat, "_prepared_runtime_preflight", lambda *_: None)
     monkeypatch.setattr(repeat, "finalize", lambda *_: (1, 0))
     if mode == "minute_collision":
         (results / datetime.now().strftime("%m%d_%H%M")).mkdir()

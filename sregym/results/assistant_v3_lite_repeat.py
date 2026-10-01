@@ -10,11 +10,15 @@ from __future__ import annotations
 import argparse
 import csv
 import fcntl
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
@@ -49,9 +53,23 @@ _REQUIRED = (
     "SPLUNK_LOGS_CONNECTION_ID",
     "ASSISTANT_V3_URL",
     "ASSISTANT_V3_AUTH_TOKEN",
+    "JUDGE_API_KEY",
+    "JUDGE_API_BASE",
 )
 _GIB = 1024**3
 _EXPECTED_CHECKS = frozenset({"metrics", "traces", "logs", "kubernetes_events", "pods", "events"})
+_SUMMARY_LINKS = {
+    "README.md": "review",
+    "starter_prompt.md": "prompt",
+    "final_answer.md": "answer",
+    "benchmark_ground_truth.md": "oracle",
+    "splunk_visible_ground_truth.md": "Splunk limits",
+    "judge_raw.csv": "judge",
+    "verification.md": "evidence",
+    "atif_trace.json": "ATIF",
+    "native_trace.jsonl": "native trace",
+    "rubric_and_metrics.md": "metrics",
+}
 
 
 def resolve_environment(source: Mapping[str, str], *, profile: str) -> dict[str, str]:
@@ -121,6 +139,8 @@ def suite_command(*, repository: Path, agent_image: str, problem: str | None, re
         agent_image,
         "--n-attempts",
         "1",
+        "--agent-timeout",
+        "1200",
     ]
     if resume_csv:
         command += ["--resume", str(resume_csv)]
@@ -156,6 +176,26 @@ def select_valid_runs(batches: Sequence[Path], expected_ids: Sequence[str]) -> t
     return selected, [case for case in expected_ids if case not in selected]
 
 
+def validate_selected_identity(selected: Mapping[str, Path], environment: Mapping[str, str]) -> None:
+    """Reject scored attempts produced under a different reviewed Lite configuration."""
+    expected = {
+        "observability_provider": "splunk",
+        "benchmark_profile": "svelte",
+        "logs_connection_id": environment["SPLUNK_LOGS_CONNECTION_ID"],
+        "requested_model": "gpt-5.6-luna",
+        "requested_reasoning": "medium",
+        "judge_model": "azure/gpt-5.6-luna",
+    }
+    for case_id, run in selected.items():
+        try:
+            metadata = json.loads((run / "run_metadata.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise RepeatError(f"unreadable attempt identity for {case_id}") from error
+        for field, value in expected.items():
+            if metadata.get(field) != value:
+                raise RepeatError(f"attempt {case_id} has mismatched {field} identity")
+
+
 def write_selection_report(report: Path, selected: Mapping[str, Path], missing: Sequence[str]) -> None:
     """The named-case scorecard links are also the dossier builder's input."""
     lines = [
@@ -186,6 +226,87 @@ def write_selection_report(report: Path, selected: Mapping[str, Path], missing: 
     temporary.replace(report)
 
 
+def _safe_status(value: object) -> str:
+    return value if isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9_]*", value) else "unverified"
+
+
+def write_campaign_summary(
+    report: Path, selected: Mapping[str, Path], expected: Sequence[str], batches: Sequence[Path]
+) -> None:
+    """Summarize saved outcomes without grading or silently omitting failed cases."""
+    lines = [
+        "# Assistant V3 SREGym-Lite campaign",
+        "",
+        "This `svelte`, symptom-guided, Splunk-only pilot is **not leaderboard-comparable**. "
+        "Scores are from the unchanged benchmark judge; Splunk-visible numeric grading is unverified.",
+        "",
+        "| Case | Outcome | Benchmark /100 | Pre-agent causal check | Evidence and raw results |",
+        "|---|---|---:|---|---|",
+    ]
+    scores: list[float] = []
+    invalid_count = 0
+    for case_id in expected:
+        if case_id in selected:
+            folder = report.parent / "by-case" / case_id
+            required_files = (*_SUMMARY_LINKS, "manifest.json", "pre_agent_proof.json")
+            if any(not (folder / name).is_file() for name in required_files):
+                raise RepeatError(f"incomplete case dossier for {case_id}")
+            manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+            proof = json.loads((folder / "pre_agent_proof.json").read_text(encoding="utf-8"))
+            if manifest.get("case_id") != case_id:
+                raise RepeatError(f"case dossier identity mismatch for {case_id}")
+            score = float(manifest["benchmark_score"])
+            if not 0 <= score <= 100:
+                raise RepeatError(f"invalid benchmark score in case dossier for {case_id}")
+            scores.append(score)
+            causal = proof.get("causal", {})
+            evidence = _safe_status(causal.get("status"))
+            links = " · ".join(f"[{label}](by-case/{case_id}/{name})" for name, label in _SUMMARY_LINKS.items())
+            lines.append(f"| {case_id} | valid | {score:g} | {evidence} | {links} |")
+            continue
+        attempts = [
+            run
+            for batch in batches
+            for run in sorted((batch / "assistant_v3" / case_id).glob("run_*"))
+            if run.is_dir()
+        ]
+        if not attempts:
+            lines.append(f"| {case_id} | missing | — | — | — |")
+            continue
+        invalid_count += 1
+        latest = attempts[-1]
+        metadata_path = latest / "run_metadata.json"
+        if metadata_path.is_file():
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                metadata = {}
+            status = _safe_status(metadata.get("classification")) if isinstance(metadata, dict) else "unverified"
+            if status == "unverified":
+                status = "incomplete"
+            if status == "completed":
+                status = "delivery_invalid"
+            link = f"[attempt metadata]({os.path.relpath(metadata_path, report.parent)})"
+        else:
+            status, link = "incomplete", "—"
+        lines.append(f"| {case_id} | {status} | — | — | {link} |")
+    attempt_label = "attempt" if len(scores) == 1 else "attempts"
+    mean = (
+        f"{sum(scores) / len(scores):g}/100 across {len(scores)} valid {attempt_label}"
+        if scores else "unavailable (0 valid attempts)"
+    )
+    lines[4:4] = [
+        f"Benchmark mean: **{mean}**. Invalid: {invalid_count}; "
+        f"missing: {len(expected) - len(scores) - invalid_count}.",
+        "A confirmed causal check is representative evidence, not proof of complete MELT delivery.",
+        "",
+    ]
+    report.parent.mkdir(parents=True, exist_ok=True)
+    temporary = report.with_name(f".{report.name}.tmp")
+    temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    temporary.replace(report)
+
+
 def _host_preflight(repository: Path, agent_image: str, min_available_gib: float = 6.0) -> None:
     try:
         result = subprocess.run(
@@ -203,6 +324,53 @@ def _host_preflight(repository: Path, agent_image: str, min_available_gib: float
     )
 
 
+def wait_for_host_preflight(
+    repository: Path,
+    agent_image: str,
+    min_available_gib: float,
+    *,
+    retries: int = 11,
+    interval_seconds: float = 30,
+) -> None:
+    """Wait at most five minutes for transient host-memory pressure only."""
+    if retries < 1 or interval_seconds <= 0:
+        raise RepeatError("resource wait settings must be positive")
+    for attempt in range(retries):  # pragma: no branch - final attempt returns or raises
+        try:
+            _host_preflight(repository, agent_image, min_available_gib)
+            return
+        except RepeatError as error:
+            if not str(error).endswith("GiB available host memory") or attempt == retries - 1:
+                raise
+            time.sleep(interval_seconds)
+
+
+def _prepared_runtime_preflight() -> None:
+    """Reject an unready cluster; main.py performs authenticated Assistant preflight."""
+    try:
+        response = subprocess.run(
+            ["kubectl", "get", "nodes", "-o", "json"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        )
+        nodes = json.loads(response.stdout)["items"]
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        raise RepeatError("Kubernetes nodes are not ready or selected context is unavailable") from error
+    if not isinstance(nodes, list) or not nodes or any(
+        not isinstance(node, dict)
+        or not any(
+            isinstance(condition, dict)
+            and condition.get("type") == "Ready"
+            and condition.get("status") == "True"
+            for condition in node.get("status", {}).get("conditions", [])
+        )
+        for node in nodes
+    ):
+        raise RepeatError("Kubernetes nodes are not ready")
+
+
 def _batches(repository: Path) -> set[Path]:
     if not (repository / "results").exists():
         return set()
@@ -211,6 +379,110 @@ def _batches(repository: Path) -> set[Path]:
         for path in (repository / "results").iterdir()
         if path.is_dir() and len(path.name) == 9 and path.name[4] == "_" and path.name.replace("_", "").isdigit()
     }
+
+
+def _campaign_fingerprint(
+    expected: Sequence[str], environment: Mapping[str, str], profile: str, agent_image: str
+) -> str:
+    """Bind saved progress to non-secret target and execution identity."""
+    identity = {
+        "cases": list(expected),
+        "profile": profile,
+        "org": environment["ORG_ID"],
+        "realm": environment["SFX_REALM"],
+        "logs_connection": environment["SPLUNK_LOGS_CONNECTION_ID"],
+        "logs_host": environment["SPLUNK_HOST"],
+        "logs_port": environment["SPLUNK_HEC_PORT"],
+        "logs_index": environment.get("SPLUNK_HEC_INDEX", "main"),
+        "assistant_url": environment["ASSISTANT_V3_URL"],
+        "agent_image": agent_image,
+        "deployment_profile": "svelte",
+        "prompt_arm": "symptom_guided",
+        "agent_model": "gpt-5.6-luna",
+        "judge_model": "azure/gpt-5.6-luna",
+        "agent_timeout_seconds": 1200,
+    }
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+
+
+def save_campaign(output: Path, state: Mapping[str, object]) -> None:
+    """Replace the small, credential-free checkpoint durably."""
+    output.mkdir(parents=True, exist_ok=True)
+    payload = (json.dumps(state, sort_keys=True, indent=2) + "\n").encode()
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".campaign.", dir=output)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, output / "campaign.json")
+        directory_descriptor = os.open(output, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def load_campaign(
+    output: Path,
+    repository: Path,
+    expected: Sequence[str],
+    environment: Mapping[str, str],
+    profile: str,
+    agent_image: str,
+) -> dict[str, object]:
+    """Read a prior checkpoint or create an empty one; never adopt unrelated output."""
+    fingerprint = _campaign_fingerprint(expected, environment, profile, agent_image)
+    path = output / "campaign.json"
+    if not path.is_file():
+        if output.exists() and any(output.iterdir()):
+            raise RepeatError("output already contains artifacts without a campaign record")
+        return {"version": 1, "fingerprint": fingerprint, "batches": [], "pending": None}
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise RepeatError("campaign record is unreadable") from error
+    if not isinstance(state, dict) or state.get("version") != 1 or state.get("fingerprint") != fingerprint:
+        raise RepeatError("campaign record belongs to a different target or configuration")
+    batches = state.get("batches")
+    if not isinstance(batches, list) or any(
+        not isinstance(name, str)
+        or re.fullmatch(r"\d{4}_\d{4}", name) is None
+        or not (repository / "results" / name).is_dir()
+        for name in batches
+    ) or len(batches) != len(set(batches)):
+        raise RepeatError("campaign record contains an invalid batch path")
+    pending = state.get("pending")
+    if pending is not None and (
+        not isinstance(pending, dict)
+        or pending.get("case_id") not in expected
+        or not isinstance(pending.get("before"), list)
+        or any(not isinstance(name, str) or re.fullmatch(r"\d{4}_\d{4}", name) is None for name in pending["before"])
+    ):
+        raise RepeatError("campaign record contains invalid pending work")
+    return state
+
+
+def recover_pending(output: Path, repository: Path, state: dict[str, object]) -> dict[str, object]:
+    """Associate an interrupted child's one new raw batch, or fail on ambiguity."""
+    pending = state.get("pending")
+    if pending is None:
+        return state
+    assert isinstance(pending, dict)
+    before = set(pending["before"])
+    created = sorted(path.name for path in _batches(repository) if path.name not in before)
+    if len(created) > 1:
+        raise RepeatError("multiple raw batches appeared during interrupted case; inspect before resuming")
+    batches = state["batches"]
+    assert isinstance(batches, list)
+    if created and created[0] not in batches:
+        batches.append(created[0])
+    state["pending"] = None
+    save_campaign(output, state)
+    return state
 
 
 def _needs_postrun_query(run: Path, expected_connection: str) -> bool:
@@ -238,8 +510,6 @@ def finalize(
     if not batches:
         raise RepeatError("at least one raw batch is required")
     selected, missing = select_valid_runs(batches, expected)
-    if not selected:
-        raise RepeatError("no completed valid attempts to package")
     from sregym.observability.splunk import SplunkConfig, SplunkHttpBackend
     from sregym.results.splunk_lite_evidence import verify_case_delivery
 
@@ -257,8 +527,62 @@ def finalize(
         checkpoint_attempt(run.parents[2], run)
     report = output / "selection.md"
     write_selection_report(report, selected, missing)
-    build_dossiers(report, output / "by-case", repository)
+    if selected:
+        build_dossiers(report, output / "by-case", repository)
+    write_campaign_summary(output / "summary.md", selected, expected, batches)
     return len(selected), len(missing)
+
+
+def run_campaign(
+    repository: Path,
+    output: Path,
+    expected: Sequence[str],
+    environment: Mapping[str, str],
+    *,
+    profile: str,
+    agent_image: str,
+    min_available_gib: float,
+) -> int:
+    """Execute one case per child, checkpointing and reporting after every case."""
+    state = load_campaign(output, repository, expected, environment, profile, agent_image)
+    state = recover_pending(output, repository, state)
+    save_campaign(output, state)
+    batches = [repository / "results" / name for name in state["batches"]]
+    if batches:
+        selected, _ = select_valid_runs(batches, expected)
+        validate_selected_identity(selected, environment)
+        finalize(repository, output, batches, expected, environment)
+    else:
+        write_selection_report(output / "selection.md", {}, expected)
+        write_campaign_summary(output / "summary.md", {}, expected, [])
+    selected, _ = select_valid_runs(batches, expected)
+    for case_id in expected:
+        if case_id in selected:
+            continue
+        wait_for_host_preflight(repository, agent_image, min_available_gib)
+        _prepared_runtime_preflight()
+        before = {path.name for path in _batches(repository)}
+        if datetime.now().strftime("%m%d_%H%M") in before:
+            raise RepeatError("a raw batch already exists for this minute; wait before running")
+        state["pending"] = {"case_id": case_id, "before": sorted(before)}
+        save_campaign(output, state)
+        command = suite_command(repository=repository, agent_image=agent_image, problem=case_id, resume_csv=None)
+        command += ["--allow-agent-endpoint", environment["ASSISTANT_V3_URL"]]
+        result = subprocess.run(command, cwd=repository, env=environment, check=False)
+        state = recover_pending(output, repository, state)
+        batches = [repository / "results" / name for name in state["batches"]]
+        if not batches or batches[-1].name in before:
+            raise RepeatError(f"runner created no raw batch for {case_id}; inspect results before resuming")
+        selected, _ = select_valid_runs(batches, expected)
+        validate_selected_identity(selected, environment)
+        finalize(repository, output, batches, expected, environment)
+        selected, _ = select_valid_runs(batches, expected)
+        print(f"Finished {case_id}: {'valid' if case_id in selected else 'incomplete'}. Open {output / 'summary.md'}")
+        if result.returncode or case_id not in selected:
+            print(f"Campaign stopped after {case_id}; rerun the same command to continue.", file=sys.stderr)
+            return 1
+    print(f"Packaged {len(selected)} valid case(s). Open {output / 'summary.md'}")
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -282,9 +606,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         expected = [args.problem] if args.problem else list(SREGYM_LITE_PROBLEMS)
         batches = [path.resolve(strict=True) for path in args.batch]
         if args.command == "run":
-            if args.min_available_gib < 6.0 and args.problem is None:
-                raise RepeatError("reduced memory floor is permitted only for a single-case smoke")
-            _host_preflight(repository, args.agent_image, args.min_available_gib)
+            if args.resume_csv or batches:
+                raise RepeatError("run resumes from its output directory; do not pass --batch or --resume-csv")
             lock_path = repository / "results/.assistant_v3_lite.lock"
             lock_path.parent.mkdir(parents=True, exist_ok=True)
             with lock_path.open("w") as lock:
@@ -292,32 +615,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError as error:
                     raise RepeatError("another Lite wrapper run is already active") from error
-                if (repository / "results" / datetime.now().strftime("%m%d_%H%M")).exists():
-                    raise RepeatError("a raw batch already exists for this minute; wait before running")
-                command = suite_command(
-                    repository=repository,
+                return run_campaign(
+                    repository, output, expected, environment,
+                    profile=args.credentials,
                     agent_image=args.agent_image,
-                    problem=args.problem,
-                    resume_csv=args.resume_csv,
+                    min_available_gib=args.min_available_gib,
                 )
-                command += ["--allow-agent-endpoint", environment["ASSISTANT_V3_URL"]]
-                before = _batches(repository)
-                result = subprocess.run(command, cwd=repository, env=environment, check=False)
-                created = _batches(repository) - before
-                if len(created) != 1:
-                    raise RepeatError("runner did not create exactly one new raw batch; inspect results")
-                batches.append(created.pop())
-                if result.returncode:
-                    print(
-                        f"Runner stopped; raw attempt retained at {batches[-1]}. "
-                        "Use finalize for completed cases, then resume.",
-                        file=sys.stderr,
-                    )
-        else:
-            result = None
         count, missing = finalize(repository, output, batches, expected, environment)
-        print(f"Packaged {count} valid case(s); {missing} missing. Open {output / 'by-case/README.md'}")
-        return 1 if (result is not None and result.returncode) or missing else 0
+        print(f"Packaged {count} valid case(s); {missing} without valid scores. Open {output / 'summary.md'}")
+        return 1 if missing else 0
     except (RepeatError, OSError, ValueError, KeyError) as error:
         print(f"Pilot wrapper: {error}", file=sys.stderr)
         return 2
