@@ -1,52 +1,126 @@
-# Repeat an Assistant V3 SREGym-Lite pilot
+# Run Assistant V3 against Splunk with SREGym-Lite
 
-This is the short path from a single Lite case to a resumable 21-case run and a
-reviewable evidence package. The wrapper delegates injection, the Assistant call,
-ATIF conversion, the benchmark judge, and attempt checkpointing to `main.py`.
-It then runs the separate bounded Splunk presence queries, copies the selected
-attempts into one folder per case, and writes a campaign `summary.md`. It does **not** change the prompt or agent
-tools. `svelte` plus the reviewed time-window/symptom prompt is a local pilot,
-not an identical leaderboard comparison.
-New attempts require run-scoped Pod-state, application-probe, and container-CPU
-metric series before V3 starts. This catches the Kind kubelet-stats TLS failure
-that older generic metrics checks missed; it does not retroactively validate
-container CPU evidence in already-saved attempts.
+This fork's wrapper runs one or all 21 Lite cases sequentially: inject a fault,
+send metrics/traces/logs/events to your Splunk org, check representative causal
+telemetry before launching Assistant V3, collect its diagnosis and ATIF trace,
+grade it with the unchanged benchmark judge, and package the results by case.
+It uses the `svelte` deployment profile and a time-window/symptom prompt, so
+the scores are a **local pilot, not leaderboard-comparable**. The wrapper does
+not provision Docker, Kind, the Splunk org, or the separate Assistant server.
 
-## Credentials and target
+## 1. Prepare the benchmark checkout
 
-For shareable documentation, the canonical environment names remain `SF_TOKEN`,
-`SPLUNK_O11Y_INGEST_TOKEN`, `SFX_REALM`, `ORG_ID`, and `USER_ID`. Locally,
-`--credentials synthetic` maps `SYNTHETIC_SF_TOKEN`,
-`SYNTHETIC_SPLUNK_ACCESS_TOKEN`, `SYNTHETIC_REALM`, `SYNTHETIC_ORG_ID`, and
-`SYNTHETIC_USER_ID` onto those names **for the child benchmark process**. It
-fails if a canonical value is also set to a different value; unset the stale
-canonical value before using this profile. In either profile, also provide
-`SPLUNK_HOST`, `SPLUNK_HEC_PORT`, `SPLUNK_HEC_TOKEN`,
-`SPLUNK_LOGS_CONNECTION_ID`, `ASSISTANT_V3_URL`, and
-`ASSISTANT_V3_AUTH_TOKEN`. The pinned Azure judge also requires
-`JUDGE_API_KEY` and `JUDGE_API_BASE` (set them to your authorized judge key
-and endpoint; the local Assistant `.env` may have these under different names).
-The synthetic access token must have ingest scope;
-the HEC token and Logs connection must target the same logs destination.
-Keep secrets in the shell or gitignored `.env`, never in a command argument or
-result folder. The wrapper does not source `.env`.
+Use `khubis/SREGym` (the fork with this Splunk adapter), not
+`SREGym/SREGym` upstream (which has no Splunk adapter). For a fresh
+SSH-authenticated clone after this documentation is merged:
 
-Start the *LangChain Deep Agents Assistant V3* local server separately using the
-**same** org/realm/user/token mapping. Its `make run-local-server-v3` target may
-source the assistant repo's `.env` and override exported variables; inspect
-that behavior or set `ASSISTANT_V3_ENV_FILE=""` and provide the intended
-environment explicitly. The wrapper verifies the runner's target and ready
-Kubernetes nodes; `main.py` then performs an authenticated Assistant session-list
-preflight before injecting a fault. Neither check can attest which org an already-running server
-was configured for. Confirm its startup environment uses the same synthetic org,
-and use a dedicated eval database as described in
-[the full guide](assistant-v3-evaluations.md).
+```bash
+git clone --branch main --recurse-submodules git@github.com:khubis/SREGym.git
+cd SREGym
+```
 
-## One-case smoke, then suite
+From that checkout (or an existing checkout on the fork's `main` branch):
 
-From the SREGym worktree, with the local Assistant V3 server and Kind/Docker
-ready, first use a prebuilt image that includes this checkout's adapter. This is
-one command **from a prepared environment**, not cluster/server provisioning:
+```bash
+git submodule update --init --recursive
+uv sync --group dev
+docker info >/dev/null
+kubectl get nodes                 # all nodes must be Ready
+bash docker/agents/build.sh      # builds sregym-agent-base:latest from this checkout
+```
+
+If there is no Kind cluster yet, follow [Kind setup](../kind/README.md) first.
+The image must be rebuilt after changing containerized code. Do not use the
+published SREGym agent image for this fork's Assistant adapter.
+
+## 2. Configure the Splunk target and judge
+
+Copy the [fill-in template](../.env.splunk-lite.example) to the gitignored
+`.env` in this checkout, fill the required blanks (except the JWT generated in
+step 3), and load it in the **same shell**
+that will run the wrapper. Do not overwrite an existing `.env` or commit secrets.
+
+```bash
+cp -n .env.splunk-lite.example .env
+# Edit .env; replace the Splunk and judge blanks. The JWT comes from step 3.
+chmod 600 .env
+set -a
+source .env
+set +a
+```
+
+| Variables | Where to get them / purpose |
+|---|---|
+| `SYNTHETIC_SF_TOKEN`, `SYNTHETIC_REALM`, `SYNTHETIC_ORG_ID`, `SYNTHETIC_USER_ID` | Query token and identity for the **same** synthetic Splunk Observability org. |
+| `SYNTHETIC_SPLUNK_ACCESS_TOKEN` | Org access token with `INGEST` scope for the collector; this is not the SF query token. |
+| `SPLUNK_HOST`, `SPLUNK_HEC_PORT`, `SPLUNK_HEC_TOKEN`, `SPLUNK_LOGS_CONNECTION_ID` | Logs HEC destination and the Logs Observer connection pointing to it. The host is a hostname only. |
+| `ASSISTANT_V3_URL`, `ASSISTANT_V3_AUTH_TOKEN` | Running v3 server URL and its raw bearer JWT (generate below; do not include `Bearer ` in the value). |
+| `JUDGE_API_BASE`, `JUDGE_API_KEY` | Authorized Azure endpoint and key for the pinned `azure/gpt-5.6-luna` judge; these can match the Assistant server's `OPENAI_ENDPOINT` and `OPENAI_API_KEY`. |
+
+`SPLUNK_LOGS_CONNECTION_ID` is the **ID of the Logs Observer connection in
+this org**, not the HEC token. That connection must point to the same HEC
+destination that receives this run's logs and Kubernetes events.
+
+The wrapper does **not** source `.env` automatically. With `--credentials
+synthetic`, it maps the five `SYNTHETIC_*` values to canonical `SF_TOKEN`,
+`SPLUNK_O11Y_INGEST_TOKEN`, `SFX_REALM`, `ORG_ID`, and `USER_ID` only for the
+benchmark child. If your shell also has one of those canonical names set to a
+different value, the wrapper fails rather than risk using two orgs; unset the
+stale canonical value. `SPLUNK_HEC_INDEX` is optional (`main` by default) and
+must be permitted by the HEC token. Never print or commit token values.
+
+## 3. Start Assistant V3 separately
+
+This is the **LangChain Deep Agents V3** server from a sibling `assistant`
+checkout, not another Assistant implementation. Follow its
+`README.md` / `.env.v3.sample` to configure and start it. For a local server,
+make a private Assistant env file from that sample; set its `SF_TOKEN`,
+`SFX_REALM`, `ORG_ID`, and `USER_ID` to the **same values** as the synthetic
+variables above, and configure its Luna model endpoint. In a separate terminal:
+
+```bash
+cd ../assistant
+cp -n .env.v3.sample .env.sregym
+# Edit .env.sregym to use the same synthetic org and your Assistant model settings.
+set -a
+source .env.sregym
+set +a
+python3 scripts/local_auth_jwt.py >/dev/null  # auth preflight; refresh SF_TOKEN if HTTP 401
+ASSISTANT_V3_ENV_FILE=.env.sregym make run-local-server-v3
+```
+
+The command above assumes you created `assistant/.env.sregym`; the Assistant
+repo ignores `.env*`. It listens on `http://127.0.0.1:8903` by default.
+Specifying `ASSISTANT_V3_ENV_FILE` prevents an unrelated `assistant/.env` from
+silently replacing the synthetic org. Use a dedicated local eval database if
+your Assistant development database has an incompatible schema; see the
+[full guide](assistant-v3-evaluations.md).
+
+Back in the SREGym shell, mint the JWT from the **same synthetic identity**.
+The Assistant helper refreshes its private `assistant/.local/local_auth.jwt`
+cache when needed. Command substitution keeps the token out of terminal output:
+
+```bash
+export ASSISTANT_V3_AUTH_TOKEN="$(
+  cd ../assistant &&
+  SF_TOKEN="$SYNTHETIC_SF_TOKEN" SFX_REALM="$SYNTHETIC_REALM" \
+    ORG_ID="$SYNTHETIC_ORG_ID" USER_ID="$SYNTHETIC_USER_ID" \
+    python3 scripts/local_auth_jwt.py
+)"
+```
+
+If either JWT command returns HTTP 401, refresh the synthetic **SF query token**
+in both private env files before proceeding. Replacing the HEC token or the
+collector's INGEST token will not fix this authentication failure.
+
+The runner checks that it can authenticate to Assistant before injecting a
+fault, but cannot inspect which org an already-running Assistant server uses.
+Confirm its startup configuration matches this file. Refresh the JWT if it
+expires during a long suite.
+
+## 4. Smoke-test one case, then run the suite
+
+This is one command **after** the setup above, not a provisioning command:
 
 ```bash
 uv run --no-sync python -m sregym.results.assistant_v3_lite_repeat run \

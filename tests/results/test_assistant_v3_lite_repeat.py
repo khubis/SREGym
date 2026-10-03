@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import runpy
 import subprocess
 import sys
@@ -13,6 +14,21 @@ from pathlib import Path
 import pytest
 
 from sregym.results import assistant_v3_lite_repeat as repeat
+
+
+def test_splunk_lite_env_example_matches_wrapper_requirements_without_secrets() -> None:
+    repository = Path(__file__).resolve().parents[2]
+    template = (repository / ".env.splunk-lite.example").read_text(encoding="utf-8")
+    names = dict(re.findall(r"^([A-Z][A-Z0-9_]*)=(.*)$", template, re.MULTILINE))
+    required = set(repeat._ALIASES) | (set(repeat._REQUIRED) - set(repeat._ALIASES.values()))
+
+    assert required <= names.keys()
+    assert not set(repeat._ALIASES.values()) & names.keys()
+    assert all(value.strip() == '""' for name, value in names.items() if name.endswith(("TOKEN", "KEY")))
+    assert "./.env.splunk-lite.example" in (repository / "README.md").read_text(encoding="utf-8")
+    assert "../.env.splunk-lite.example" in (repository / "docs/assistant-v3-lite-repeat.md").read_text(
+        encoding="utf-8"
+    )
 
 
 def _environment() -> dict[str, str]:

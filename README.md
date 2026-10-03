@@ -33,6 +33,17 @@ SREGym has been used to simulate real-world cloud failures, such as:
 
 [SREGym-Lite](./docs/SREGym-Lite.md) is a curated set of 21 representative problems with varied difficulty levels that are friendly to run. It is the recommended starting point for new users and can run easily on a [Kind](https://kind.sigs.k8s.io/) setup with 8 vCPU and 16 GB of memory.
 
+### Splunk-adapted Assistant V3 Lite pilot (this fork)
+
+To send a Lite case's telemetry to a Splunk Observability org and evaluate the
+LangChain Deep Agents Assistant V3 against it, start with the
+[step-by-step Splunk Lite runbook](./docs/assistant-v3-lite-repeat.md) and
+[fill-in environment template](./.env.splunk-lite.example). The runbook covers
+the separate Assistant server, one-case smoke test, resumable 21-case command,
+and per-case results. This `svelte`, symptom-guided pilot is not a leaderboard
+comparison; the ordinary SREGym quickstart below uses its native observability
+stack instead.
+
 
 <h2 id="📦installation">📦 Installation</h2>
 
