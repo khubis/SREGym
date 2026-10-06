@@ -24,11 +24,52 @@ def test_splunk_lite_env_example_matches_wrapper_requirements_without_secrets() 
 
     assert required <= names.keys()
     assert not set(repeat._ALIASES.values()) & names.keys()
-    assert all(value.strip() == '""' for name, value in names.items() if name.endswith(("TOKEN", "KEY")))
+    assert all(
+        value.strip() == '""'
+        for name, value in names.items()
+        if name.endswith(("TOKEN", "KEY")) and name != "JUDGE_API_KEY"
+    )
+    assert names["JUDGE_API_KEY"].strip() == '"unused-placeholder"'
+    assert names["SREGYM_LITE_JUDGE_MODEL"].strip() == '"openai/gpt-5.6-luna"'
+    assert names["SREGYM_LLM_GATEWAY_SERVICE_NAME"].strip() == '"sregym"'
+    assert names["JUDGE_API_BASE"].strip() == '"https://llm-gateway.lab0.signalfx.com/openai/v1"'
+    assert "SREGYM_LLM_GATEWAY_ORG_ID" not in names
     assert "./.env.splunk-lite.example" in (repository / "README.md").read_text(encoding="utf-8")
     assert "../.env.splunk-lite.example" in (repository / "docs/assistant-v3-lite-repeat.md").read_text(
         encoding="utf-8"
     )
+    assert "--env-file .env.splunk-lite" in (repository / "README.md").read_text(encoding="utf-8")
+    assert "--env-file .env.splunk-lite" in (repository / "docs/assistant-v3-lite-repeat.md").read_text(
+        encoding="utf-8"
+    )
+    ignored = subprocess.run(
+        ["git", "check-ignore", "-q", ".env.splunk-lite"], cwd=repository, check=False
+    )
+    assert ignored.returncode == 0
+
+
+def test_assistant_env_example_separates_gateway_embeddings_and_eval_memory() -> None:
+    repository = Path(__file__).resolve().parents[2]
+    template = (repository / ".env.assistant-v3-splunk.example").read_text(encoding="utf-8")
+    names = dict(re.findall(r"^([A-Z][A-Z0-9_]*)=(.*)$", template, re.MULTILINE))
+
+    for key in ("SF_TOKEN", "SFX_REALM", "ORG_ID", "USER_ID"):
+        assert names[key] == '""'
+    assert names["USE_LLM_GATEWAY_SERVICE"] == "true"
+    assert names["ASSISTANT_V3_USE_LLM_GATEWAY_SERVICE"] == "true"
+    assert names["ASSISTANT_V3_MEMORY_USE_LLM_GATEWAY_SERVICE"] == "true"
+    assert names["ASSISTANT_V3_MEMORY_EMBEDDING_MODEL"] == "text-embedding-3-large"
+    assert names["LLM_GATEWAY_SERVICE_URL"] == names["ASSISTANT_V3_LLM_GATEWAY_SERVICE_URL"]
+    assert names["USE_OPENAI_PROXY"] == "false"
+    assert names["DEEPEVAL_FILE_SYSTEM"] == "READ_ONLY"
+    assert names["DEEPEVAL_CACHE_FOLDER"] == ".local/deepeval"
+    assert "LLM_PROXY_SF_TOKEN" not in names
+    assert "OPENAI_API_KEY" not in names
+    assert names["MEMORY_PG_DATABASE"] == names["AIMEMORY_DB_NAME"]
+    assert names["ASSISTANT_V3_O11Y_POSTGRES_DATABASE"] == names["TOOL_DB_NAME"]
+    databases = {names[key] for key in ("POSTGRES_DATABASE", "AIMEMORY_DB_NAME", "TOOL_DB_NAME")}
+    assert len(databases) == 3
+    assert all(database.startswith("sregym_") for database in databases)
 
 
 def _environment() -> dict[str, str]:
@@ -71,6 +112,21 @@ def test_canonical_profile_does_not_use_synthetic_fallback() -> None:
         repeat.resolve_environment(_environment(), profile="canonical")
 
 
+def test_helm_environment_is_local_to_checkout_and_preserves_explicit_overrides(tmp_path: Path) -> None:
+    environment = _environment()
+    repeat.prepare_helm_environment(environment, tmp_path)
+
+    assert environment["HELM_REPOSITORY_CONFIG"] == str(tmp_path / ".local/helm/repositories.yaml")
+    assert environment["HELM_REPOSITORY_CACHE"] == str(tmp_path / ".local/helm/repository")
+    assert Path(environment["HELM_REPOSITORY_CACHE"]).is_dir()
+    assert not Path(environment["HELM_REPOSITORY_CONFIG"]).exists()
+
+    explicit = dict(environment, HELM_REPOSITORY_CONFIG=str(tmp_path / "custom/repos.yaml"))
+    repeat.prepare_helm_environment(explicit, tmp_path)
+    assert explicit["HELM_REPOSITORY_CONFIG"] == str(tmp_path / "custom/repos.yaml")
+    assert (tmp_path / "custom").is_dir()
+
+
 def test_canonical_profile_accepts_complete_names_without_aliases() -> None:
     source = _environment()
     for alias, canonical in repeat._ALIASES.items():
@@ -87,6 +143,45 @@ def test_judge_credentials_are_required_before_launch() -> None:
     source = _environment()
     del source["JUDGE_API_KEY"]
     with pytest.raises(repeat.RepeatError, match="JUDGE_API_KEY"):
+        repeat.resolve_environment(source, profile="synthetic")
+
+
+def test_gateway_judge_uses_target_org_without_repeating_org_id() -> None:
+    source = _environment()
+    source["SREGYM_LITE_JUDGE_MODEL"] = "openai/gpt-5.6-luna"
+    source["SREGYM_LLM_GATEWAY_SERVICE_NAME"] = "sregym"
+    mapped = repeat.resolve_environment(source, profile="synthetic")
+
+    assert mapped["SREGYM_LLM_GATEWAY_ORG_ID"] == "synthetic-org"
+    assert mapped["SREGYM_LITE_JUDGE_MODEL"] == "openai/gpt-5.6-luna"
+    assert repeat._campaign_fingerprint(["network_policy_block"], mapped, "synthetic", "image:tag") != (
+        repeat._campaign_fingerprint(
+            ["network_policy_block"],
+            repeat.resolve_environment(_environment(), profile="synthetic"),
+            "synthetic",
+            "image:tag",
+        )
+    )
+
+    changed_endpoint = dict(mapped, JUDGE_API_BASE="https://other-gateway.example.test/openai/v1")
+    assert repeat._campaign_fingerprint(["network_policy_block"], mapped, "synthetic", "image:tag") != (
+        repeat._campaign_fingerprint(["network_policy_block"], changed_endpoint, "synthetic", "image:tag")
+    )
+
+
+def test_gateway_judge_rejects_mismatched_org_or_unsupported_model() -> None:
+    source = _environment()
+    source.update(
+        SREGYM_LITE_JUDGE_MODEL="openai/gpt-5.6-luna",
+        SREGYM_LLM_GATEWAY_SERVICE_NAME="sregym",
+        SREGYM_LLM_GATEWAY_ORG_ID="different-org",
+    )
+    with pytest.raises(repeat.RepeatError, match="gateway org"):
+        repeat.resolve_environment(source, profile="synthetic")
+
+    source["SREGYM_LLM_GATEWAY_ORG_ID"] = "synthetic-org"
+    source["SREGYM_LITE_JUDGE_MODEL"] = "openai/other-model"
+    with pytest.raises(repeat.RepeatError, match="SREGYM_LITE_JUDGE_MODEL"):
         repeat.resolve_environment(source, profile="synthetic")
 
 
@@ -159,6 +254,14 @@ def test_suite_command_is_sequential_pilot_configuration(tmp_path: Path) -> None
     assert command[command.index("--assistant-prompt-arm") + 1] == "symptom_guided"
     assert "--force-build" not in command
     assert command[command.index("--agent-timeout") + 1] == "1200"
+    gateway_command = repeat.suite_command(
+        repository=tmp_path,
+        agent_image="sregym-agent-base:latest",
+        problem="network_policy_block",
+        resume_csv=None,
+        judge_model="openai/gpt-5.6-luna",
+    )
+    assert gateway_command[gateway_command.index("--judge-model") + 1] == "openai/gpt-5.6-luna"
 
     with pytest.raises(repeat.RepeatError, match="resume CSV"):
         repeat.suite_command(
