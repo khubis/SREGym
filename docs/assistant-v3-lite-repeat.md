@@ -427,8 +427,31 @@ variables and successfully fetched a 1536-dimensional `text-embedding-3-small`
 vector using the synthetic identity. The template now uses this verified default
 and a separate small-memory database name. Main uses the shared V3 gateway
 configuration; no embedding-specific flag, model, or dimension override is needed.
-This verifies the embedding connection on main; the complete benchmark was not
-rerun for this documentation update.
+
+### Fresh-template main workflow retest (2026-10-06)
+
+Copied the revised Assistant template into a new private env file, filled only
+the synthetic identity and fresh session/tool/small-memory database names, and
+started Assistant main `dcfe07343` with the documented V3 Make target. No
+embedding-specific environment variables or custom routing branch were used.
+The JWT and default-small embedding preflights passed after refreshing the
+expired synthetic SF query token.
+
+The documented one-case command completed the CronJob case with a valid result
+and **44/100** benchmark score. Representative pre-agent causal and delivery
+checks passed; the closing audit was valid and drained, with zero final queues
+and zero send/enqueue failure deltas in all four pipelines. The terminal answer
+matched its single judge submission and final ATIF message. Native and ATIF-v1.7
+traces were retained (79 ATIF steps), with 35 root/subagent tool calls, 8 failed
+tool results, 379.2 seconds agent duration, and 1,213,678 reported tokens.
+
+The local gitignored evidence package is
+`results/reproductions/assistant-main-default-embeddings-20261006/summary.md`;
+raw provenance is in `results/1006_1602`. This qualifies one end-to-end case on
+the existing provisioned host, not a fresh-machine installation, all 21 cases,
+or diagnosis accuracy. Normal teardown completed and the wrapper exited zero.
+Repeating the same command and output folder reused the valid result without
+starting another simulation. The owned test server was stopped afterward.
 
 Check the wrapper itself before a campaign:
 
