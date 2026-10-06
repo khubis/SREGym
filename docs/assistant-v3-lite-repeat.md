@@ -253,18 +253,16 @@ is an incomplete attempt, never a zero diagnosis score. It reuses the local imag
 rebuilding it. Rebuild that image with the full-guide command after changing
 containerized code; check its image ID before reusing it. The wrapper refuses
 to start if the image is absent, another wrapper run holds the lock, fewer than
-6 GiB of host memory or 10 GiB of disk are free, or Docker has under 8 GiB
+10 GiB of disk are free, or Docker has under 8 GiB
 allocated. It also requires Ready nodes in the selected `kubectl` context;
 the benchmark runner subsequently checks Assistant authentication before injection.
-These gates are rechecked before **every** case. They are *start gates*, not a
-guarantee against later pressure; watch Docker/host memory during the first
-case. It never prunes resources. On this constrained laptop, the previously
-live-tested 4 GiB floor can be explicitly selected for the sequential suite
-with `--min-available-gib 4`. Never lower it further. Stop if available RAM
-approaches 2 GiB; this is a local override, not the recommended default.
-If memory is temporarily below the chosen floor between cases, the wrapper
-waits and rechecks for up to five minutes; it does not wait through disk,
-Docker, image, or cluster failures and never lowers the floor automatically.
+These checks are repeated before **every** case. Host available memory below
+6 GiB prints a **warning only**; it does not block or wait. The existing
+`--min-available-gib` option changes that advisory threshold, not a safety floor.
+Available memory is a point-in-time estimate, not a measurement of Docker's
+remaining capacity or a prediction of the next case's needs. Monitor host/Docker
+memory and stop if pressure becomes severe. Disk/Docker checks remain start
+gates, not a guarantee against later pressure. The wrapper never prunes resources.
 
 ## Recover or review a partial batch
 
@@ -402,6 +400,18 @@ This constrained-host smoke used `--min-available-gib 4`; the documented command
 defaults to 6 GiB. It does not qualify every laptop, the complete suite, or the
 gateway's production authentication/authorization controls. The required
 Assistant change is published in MR !3836; use its branch until merged.
+
+### Sequential suite-path smoke (2026-10-05)
+
+With host-memory checking changed to warning-only, the suite CLI selected all
+21 cases without `--problem`. A local test-only boundary stopped it before case
+three, after the first two completed cleanup and checkpointing. CronJob (Hotel
+Reservation) scored 89/100; edge/WAF (Astronomy Shop) scored 44/100. Both passed
+the representative pre-agent evidence gates and closing delivery audits; native
+and ATIF traces were saved, and each final answer matched its judge submission.
+The local package is `results/reproductions/lite-suite-smoke-20261005/summary.md`.
+The remaining 19 cases were intentionally not run: this qualifies the sampled
+sequential workflow, not the full suite or a performance comparison.
 
 Check the wrapper itself before a campaign:
 

@@ -185,10 +185,17 @@ def test_gateway_judge_rejects_mismatched_org_or_unsupported_model() -> None:
         repeat.resolve_environment(source, profile="synthetic")
 
 
-def test_headroom_gate_fails_closed() -> None:
+def test_low_host_memory_warns_without_blocking(capsys: pytest.CaptureFixture[str]) -> None:
     gib = 1024**3
-    with pytest.raises(repeat.RepeatError, match="memory"):
-        repeat.check_headroom(available_bytes=2 * gib, free_disk_bytes=20 * gib, docker_memory_bytes=10 * gib)
+    repeat.check_headroom(available_bytes=2 * gib, free_disk_bytes=20 * gib, docker_memory_bytes=10 * gib)
+    warning = capsys.readouterr().err
+    assert "Warning" in warning
+    assert "2" in warning and "6" in warning
+    assert "continuing" in warning
+
+
+def test_disk_and_docker_checks_still_fail_closed() -> None:
+    gib = 1024**3
     with pytest.raises(repeat.RepeatError, match="disk"):
         repeat.check_headroom(available_bytes=7 * gib, free_disk_bytes=2 * gib, docker_memory_bytes=10 * gib)
     with pytest.raises(repeat.RepeatError, match="Docker"):
@@ -224,17 +231,18 @@ def test_resource_wait_retries_only_transient_memory_pressure(monkeypatch: pytes
         repeat.wait_for_host_preflight(tmp_path, "image:tag", 4.0, retries=1)
 
 
-def test_single_case_memory_override_keeps_a_four_gib_floor() -> None:
+def test_memory_override_changes_warning_threshold(capsys: pytest.CaptureFixture[str]) -> None:
     gib = 1024**3
     repeat.check_headroom(
         available_bytes=4.2 * gib, free_disk_bytes=20 * gib, docker_memory_bytes=10 * gib,
         min_available_gib=4.0,
     )
-    with pytest.raises(repeat.RepeatError, match="memory"):
-        repeat.check_headroom(
-            available_bytes=3.9 * gib, free_disk_bytes=20 * gib, docker_memory_bytes=10 * gib,
-            min_available_gib=4.0,
-        )
+    assert capsys.readouterr().err == ""
+    repeat.check_headroom(
+        available_bytes=3.9 * gib, free_disk_bytes=20 * gib, docker_memory_bytes=10 * gib,
+        min_available_gib=4.0,
+    )
+    assert "Warning" in capsys.readouterr().err
     with pytest.raises(repeat.RepeatError, match="memory floor"):
         repeat.check_headroom(
             available_bytes=7 * gib, free_disk_bytes=20 * gib, docker_memory_bytes=10 * gib,
@@ -839,13 +847,20 @@ def test_run_cli_rejects_low_headroom_before_launch(
     assert exit_code == 2
 
 
-def test_run_cli_accepts_four_gib_floor_for_sequential_suite(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_run_cli_continues_sequential_suite_with_low_host_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     (tmp_path / "results").mkdir()
     monkeypatch.setattr(repeat.os, "environ", _environment())
     floors: list[float] = []
-    monkeypatch.setattr(repeat, "_host_preflight", lambda _repo, _image, floor: floors.append(floor))
+    monkeypatch.setattr(repeat.time, "sleep", lambda *_: None)
+    def low_memory(_repo: Path, _image: str, threshold: float) -> None:
+        floors.append(threshold)
+        repeat.check_headroom(
+            available_bytes=2 * 1024**3, free_disk_bytes=20 * 1024**3,
+            docker_memory_bytes=10 * 1024**3, min_available_gib=threshold,
+        )
+    monkeypatch.setattr(repeat, "_host_preflight", low_memory)
     monkeypatch.setattr(repeat, "_prepared_runtime_preflight", lambda: None)
     monkeypatch.setattr(repeat, "finalize", lambda *_: (0, 0))
     monkeypatch.setattr(repeat, "SREGYM_LITE_PROBLEMS", list(repeat.SREGYM_LITE_PROBLEMS)[:2])
@@ -859,9 +874,19 @@ def test_run_cli_accepts_four_gib_floor_for_sequential_suite(
     assert repeat.main([
         "run", "--credentials", "synthetic", "--repository", str(tmp_path),
         "--output", str(tmp_path / "results/reproductions/pilot"),
-        "--min-available-gib", "4",
     ]) == 0
-    assert floors == [4.0, 4.0]
+    assert floors == [6.0, 6.0]
+    assert capsys.readouterr().err.count("Warning") == 2
+
+
+def test_low_memory_check_warns_in_a_real_subprocess() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", "from sregym.results.assistant_v3_lite_repeat import check_headroom; "
+         "check_headroom(available_bytes=2*1024**3, free_disk_bytes=20*1024**3, docker_memory_bytes=10*1024**3)"],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0
+    assert "Warning" in result.stderr and "continuing" in result.stderr
 
 
 def test_host_preflight_uses_docker_limit_and_rejects_missing_image(

@@ -120,11 +120,16 @@ def prepare_helm_environment(environment: dict[str, str], repository: Path) -> N
 def check_headroom(
     *, available_bytes: int, free_disk_bytes: int, docker_memory_bytes: int, min_available_gib: float = 6.0
 ) -> None:
-    """Conservative 16 GiB laptop gate; never auto-prune user resources."""
+    """Warn on host memory; require disk/Docker capacity, never auto-prune."""
     if not 4.0 <= min_available_gib <= 6.0:
         raise RepeatError("memory floor must be between 4 and 6 GiB")
     if available_bytes < min_available_gib * _GIB:
-        raise RepeatError(f"less than {min_available_gib:g} GiB available host memory")
+        print(
+            f"Warning: {available_bytes / _GIB:.1f} GiB available host memory is below "
+            f"the {min_available_gib:g} GiB advisory threshold; continuing. "
+            "Monitor host/Docker memory; this snapshot does not predict case requirements.",
+            file=sys.stderr, flush=True,
+        )
     if free_disk_bytes < 10 * _GIB:
         raise RepeatError("less than 10 GiB free disk")
     if docker_memory_bytes < 8 * _GIB:
@@ -636,7 +641,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--problem", choices=SREGYM_LITE_PROBLEMS)
     parser.add_argument("--resume-csv", type=Path)
     parser.add_argument("--agent-image", default="sregym-agent-base:latest")
-    parser.add_argument("--min-available-gib", type=float, default=6.0)
+    parser.add_argument(
+        "--min-available-gib", type=float, default=6.0,
+        help="host-memory warning threshold only (4–6 GiB); low memory does not block or wait",
+    )
     args = parser.parse_args(argv)
     try:
         environment = resolve_environment(os.environ, profile=args.credentials)
