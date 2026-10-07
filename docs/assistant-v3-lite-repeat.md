@@ -63,6 +63,11 @@ dependencies during deployment. Explicit `HELM_REPOSITORY_CONFIG` and
 Copy the [fill-in template](../.env.splunk-lite.example) to the gitignored
 `.env.splunk-lite` in this checkout and fill its Splunk blanks. The JWT can be
 exported in step 3. Do not overwrite an existing private file or commit secrets.
+If you already have a private `.env`, transfer its synthetic identity and HEC
+values into the new file. Keep the new template's local Assistant URL and judge
+route; do not transfer placeholder Assistant values or an old Azure judge
+endpoint. `ASSISTANT_V3_URL` must be the server's HTTP(S) base URL, without an
+API path, and `ASSISTANT_V3_AUTH_TOKEN` must be its raw JWT.
 
 ```bash
 cp -n .env.splunk-lite.example .env.splunk-lite
@@ -73,7 +78,7 @@ chmod 600 .env.splunk-lite
 | Variables | Where to get them / purpose |
 |---|---|
 | `SYNTHETIC_SF_TOKEN`, `SYNTHETIC_REALM`, `SYNTHETIC_ORG_ID`, `SYNTHETIC_USER_ID` | Query token and identity for the **same** synthetic Splunk Observability org. |
-| `SYNTHETIC_SPLUNK_ACCESS_TOKEN` | Org access token with `INGEST` scope for the collector; this is not the SF query token. |
+| `SYNTHETIC_SPLUNK_ACCESS_TOKEN` | Org access token with `INGEST` scope for the collector. Use it for queries as well only if its API permissions have been verified (see the JWT checks below). |
 | `SPLUNK_HOST`, `SPLUNK_HEC_PORT`, `SPLUNK_HEC_TOKEN`, `SPLUNK_LOGS_CONNECTION_ID` | Logs HEC destination and the Logs Observer connection pointing to it. The host is a hostname only. |
 | `ASSISTANT_V3_URL`, `ASSISTANT_V3_AUTH_TOKEN` | Running v3 server URL and its raw bearer JWT (generate below; do not include `Bearer ` in the value). |
 | `SREGYM_LITE_JUDGE_MODEL`, `JUDGE_API_BASE`, `JUDGE_API_KEY` | The template uses the lab0 LLM Gateway (`openai/gpt-5.6-luna` and `/openai/v1`). Its API key is an unused LiteLLM placeholder, not an Azure secret. |
@@ -128,6 +133,16 @@ Run these in the separate Assistant checkout; preserve any local edits before
 switching branches. Do not use an older checkout predating that fix. No separate
 memory gateway opt-in or custom embedding-routing branch is needed.
 
+If you need the separate repository, clone
+`https://cd.splunkdev.com/observability/ai/assistant.git` using your authorized
+GitLab credentials. If SSH access is unavailable, use the HTTPS credential
+helper (authenticate with `dev-login gitlab` first if needed):
+
+```bash
+git -c credential.helper='!glab auth git-credential' clone \
+  https://cd.splunkdev.com/observability/ai/assistant.git
+```
+
 Chat and memory now share the V3 gateway selector and URL; their model choices
 remain separate:
 
@@ -145,13 +160,14 @@ callers. Org/service headers are attribution, not a security boundary.
 Use a **fresh dedicated memory database** for the default small-model vectors.
 If migrating from our earlier template, remove its embedding-model and routing
 overrides from your private env file and use the new small-memory database name.
-Do not reuse an index containing large-model (3072-dimensional) vectors with
-the default small model (1536 dimensions); it needs rebuilding or a fresh database.
+Do not reuse an index containing large-model (3072-dimensional) vectors with the
+default small model (1536 dimensions); it needs rebuilding or a fresh database.
 `AIMEMORY_DB_NAME` and
 `MEMORY_PG_DATABASE` must match; the V3 Make target exports the former as the
-latter. The V3 memory routing change does not change the separate legacy documentation-search
-embedding path. The template also gives DeepEval an explicit read-only cache
-location, avoiding a startup error caused by an empty generated cache path.
+latter. The V3 memory routing change does not change the separate legacy
+documentation-search embedding path. The template also gives DeepEval an explicit
+read-only cache location, avoiding a startup error caused by an empty generated
+cache path.
 
 Do not set `ASSISTANT_V3_OPENAI_BASE_URL` when gateway mode is enabled; V3
 rejects that combination. The Assistant server derives its own gateway
@@ -170,7 +186,7 @@ set +a
 python3 scripts/local_auth_jwt.py >/dev/null || exit 1  # refresh SF_TOKEN if HTTP 401
 uv run --locked python -c 'import asyncio; from src.server.assistant_v3.semantic_memory.embedder import SemanticMemoryEmbedder; e=SemanticMemoryEmbedder(); v=asyncio.run(e.embed_one("SREGym setup check")); assert len(v)==e.dimension; print("Embedding preflight passed:", len(v), "dimensions")' || exit 1
 make -s postgres-up
-docker exec aiassistantdb createdb -U postgres sregym_gateway_eval
+docker exec aiassistantdb createdb -U postgres "$POSTGRES_DATABASE"
 ASSISTANT_V3_ENV_FILE=.env.sregym make -B run-local-server-v3
 ```
 
@@ -210,6 +226,7 @@ export ASSISTANT_V3_AUTH_TOKEN="$(
   cd "$ASSISTANT_REPO" &&
   SF_TOKEN="$SYNTHETIC_SF_TOKEN" SFX_REALM="$SYNTHETIC_REALM" \
     ORG_ID="$SYNTHETIC_ORG_ID" USER_ID="$SYNTHETIC_USER_ID" \
+    LOCAL_AUTH_JWT_CACHE_FILE=.local/local_auth.sregym.jwt \
     python3 scripts/local_auth_jwt.py
 )"
 ```
@@ -219,9 +236,27 @@ The nonempty shell JWT takes precedence over the blank template entry when
 private `.env.splunk-lite` and refresh it if it expires. Never put it in the
 tracked example.
 
-If either JWT command returns HTTP 401, refresh the synthetic **SF query token**
-in both private env files before proceeding. Replacing the HEC token or the
-collector's INGEST token will not fix this authentication failure.
+If either JWT command returns HTTP 401, the synthetic **SF query token** is
+not accepted. Update `SYNTHETIC_SF_TOKEN` in the runner's private env file and
+`SF_TOKEN` in the Assistant's private env file with a valid token for the same
+org/identity, reload the files, and rerun the JWT command. Do not start a case
+until it succeeds. An existing SignalFx token stored as
+`SYNTHETIC_SPLUNK_ACCESS_TOKEN` can also be used for `SYNTHETIC_SF_TOKEN` and
+`SF_TOKEN` **if** it has the required API permissions and belongs to the same
+synthetic org. The token field name alone does not establish its permissions.
+Verify the org with `GET https://api.<realm>.signalfx.com/v2/organization`,
+check a read endpoint such as `GET https://api.<realm>.signalfx.com/v2/metric?limit=1`,
+and verify JWT minting with the helper before using it. Send the token in the
+`X-SF-TOKEN` header; each check must return HTTP 200. A successful JWT check
+alone does not establish the read permissions required by the tools. A Splunk
+HEC token or unused judge API-key placeholder cannot replace the SF token.
+
+For a dedicated evaluation JWT cache, set `LOCAL_AUTH_JWT_CACHE_FILE` to a
+private path such as `.local/local_auth.sregym.jwt` in the Assistant env file,
+and use that same setting when minting the runner JWT. The helper otherwise
+uses `.local/local_auth.jwt`. A valid cached JWT can be reused; creating a new
+private cache path forces a fresh token check without deleting another
+workflow's cached credentials.
 
 The runner checks that it can authenticate to Assistant before injecting a
 fault, but cannot inspect which org an already-running Assistant server uses.
@@ -247,6 +282,11 @@ The image flag is omitted because the wrapper defaults to the locally built
 tag. The one-line command starts the **evaluation**, not the Assistant server
 or Kind. Changing the judge route/model creates a different campaign identity;
 use a new output directory instead of trying to resume an old direct-Azure run.
+A wrapper update can also change the fingerprint format. If startup reports
+`campaign record belongs to a different target or configuration`, preserve the
+old output folder and select a fresh `--output` for the current settings. This
+can happen even when the old folder has no raw runs. Do not edit the stored
+fingerprint to bypass the identity check.
 
 The command runs cases sequentially in separate benchmark child processes,
 one attempt each, using the svelte
@@ -267,6 +307,11 @@ Available memory is a point-in-time estimate, not a measurement of Docker's
 remaining capacity or a prediction of the next case's needs. Monitor host/Docker
 memory and stop if pressure becomes severe. Disk/Docker checks remain start
 gates, not a guarantee against later pressure. The wrapper never prunes resources.
+
+The runtime-memory check supports Docker and Podman exposed through the `docker`
+command. It uses Docker's `MemTotal` field first, then Podman's `Host.MemTotal`
+if the first command fails. It reads the actual reported capacity and keeps the
+8 GiB runtime-memory requirement and prebuilt-image check unchanged.
 
 ## Recover or review a partial batch
 
